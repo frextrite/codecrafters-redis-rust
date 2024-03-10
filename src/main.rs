@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::net::TcpListener;
 
 const ADDR: &str = "127.0.0.1:6379";
@@ -9,11 +10,12 @@ fn main() {
 
     for incoming_stream in listener.incoming() {
         match incoming_stream {
-            Ok(stream) => {
+            Ok(mut stream) => {
                 println!(
                     "INFO: accepted incoming connection from {:?}",
                     stream.peer_addr()
                 );
+                write!(stream, "+PONG\r\n").unwrap();
             }
             Err(error) => {
                 eprintln!(

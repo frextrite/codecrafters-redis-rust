@@ -1,22 +1,26 @@
-// Uncomment this block to pass the first stage
-// use std::net::TcpListener;
+use std::net::TcpListener;
+
+const ADDR: &str = "127.0.0.1:6379";
 
 fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
+    let listener = TcpListener::bind(ADDR).unwrap();
 
-    // Uncomment this block to pass the first stage
-    //
-    // let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
-    //
-    // for stream in listener.incoming() {
-    //     match stream {
-    //         Ok(_stream) => {
-    //             println!("accepted new connection");
-    //         }
-    //         Err(e) => {
-    //             println!("error: {}", e);
-    //         }
-    //     }
-    // }
+    println!("INFO: started listener on {:?}", ADDR);
+
+    for incoming_stream in listener.incoming() {
+        match incoming_stream {
+            Ok(stream) => {
+                println!(
+                    "INFO: accepted incoming connection from {:?}",
+                    stream.peer_addr()
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "ERROR: failed to accept an incoming connection with error {:?}",
+                    error
+                );
+            }
+        }
+    }
 }

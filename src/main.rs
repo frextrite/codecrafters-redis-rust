@@ -121,6 +121,10 @@ fn parse_message(message: &[u8]) -> Option<Command> {
     }
 }
 
+// TcpStream::read() is *not* guaranteed to return the entire command, which means multiple
+// calls to read() are required to read an entire command.
+// TODO: handle the above scenario in which multiple calls to read() are required to obtain a
+// single command
 fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Result<()> {
     let mut buf = [0; 1024];
     loop {

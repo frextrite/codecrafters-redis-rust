@@ -33,9 +33,9 @@ impl State {
 
 enum Command<'a> {
     Ping,
-    Echo(&'a str),
-    Get(&'a str),
-    Set(&'a str, &'a str),
+    Echo(&'a [u8]),
+    Get(&'a [u8]),
+    Set(&'a [u8], &'a [u8]),
 }
 
 fn serialize_to_bulkstring(data: Option<&[u8]>) -> Vec<u8> {
@@ -61,16 +61,16 @@ fn handle_command(
 ) -> std::io::Result<()> {
     match command {
         Command::Ping => stream.write(&serialize_to_simplestring(b"PONG"))?,
-        Command::Echo(data) => stream.write(&serialize_to_bulkstring(Some(data.as_bytes())))?,
+        Command::Echo(data) => stream.write(&serialize_to_bulkstring(Some(data)))?,
         Command::Get(key) => {
             let mut state = state.lock().unwrap();
-            let value = state.get(key.as_bytes()).map(|v| v.to_vec());
+            let value = state.get(key).map(|v| v.to_vec());
             drop(state);
             stream.write(&serialize_to_bulkstring(value.as_deref()))?
         }
         Command::Set(key, value) => {
             let mut state = state.lock().unwrap();
-            state.set(key.as_bytes(), value.as_bytes());
+            state.set(key, value);
             drop(state);
             stream.write(&serialize_to_simplestring(b"OK"))?
         }
@@ -104,11 +104,11 @@ fn parse_message(message: &[u8]) -> Option<Command> {
             if segments[2].eq_ignore_ascii_case("ping") {
                 Some(Command::Ping)
             } else if segments[2].eq_ignore_ascii_case("echo") {
-                Some(Command::Echo(segments[4]))
+                Some(Command::Echo(segments[4].as_bytes()))
             } else if segments[2].eq_ignore_ascii_case("get") {
-                Some(Command::Get(segments[4]))
+                Some(Command::Get(segments[4].as_bytes()))
             } else if segments[2].eq_ignore_ascii_case("set") {
-                Some(Command::Set(segments[4], segments[6]))
+                Some(Command::Set(segments[4].as_bytes(), segments[6].as_bytes()))
             } else {
                 None
             }

@@ -64,12 +64,14 @@ fn handle_command(
         Command::Echo(data) => stream.write(&serialize_to_bulkstring(Some(data.as_bytes())))?,
         Command::Get(key) => {
             let mut state = state.lock().unwrap();
-            let value = state.get(key.as_bytes());
-            stream.write(&serialize_to_bulkstring(value.map(|v| v.as_slice())))?
+            let value = state.get(key.as_bytes()).map(|v| v.to_vec());
+            drop(state);
+            stream.write(&serialize_to_bulkstring(value.as_deref()))?
         }
         Command::Set(key, value) => {
             let mut state = state.lock().unwrap();
             state.set(key.as_bytes(), value.as_bytes());
+            drop(state);
             stream.write(&serialize_to_simplestring(b"OK"))?
         }
     };

@@ -1,8 +1,10 @@
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::str;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use redis_starter_rust::state;
 
 const ADDR: &str = "127.0.0.1:6379";
 #[allow(dead_code)]
@@ -12,21 +14,21 @@ const LF: u8 = b'\n';
 const CRLF: &str = "\r\n";
 
 struct State {
-    store: HashMap<Vec<u8>, Vec<u8>>,
+    store: state::ExpiringHashMap,
 }
 
 impl State {
     fn new() -> State {
         State {
-            store: HashMap::new(),
+            store: state::ExpiringHashMap::new(),
         }
     }
 
-    fn set(&mut self, key: &[u8], value: &[u8]) {
-        self.store.insert(key.to_vec(), value.to_vec());
+    fn set(&mut self, key: &[u8], value: &[u8], expiry: Option<Duration>) {
+        self.store.set(key, value, expiry);
     }
 
-    fn get(&mut self, key: &[u8]) -> Option<&Vec<u8>> {
+    fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         self.store.get(key)
     }
 }
@@ -35,7 +37,12 @@ enum Command<'a> {
     Ping,
     Echo(&'a [u8]),
     Get(&'a [u8]),
-    Set(&'a [u8], &'a [u8]),
+    Set {
+        key: &'a [u8],
+        value: &'a [u8],
+        #[allow(dead_code)]
+        expiry: Option<Duration>,
+    },
 }
 
 fn serialize_to_bulkstring(data: Option<&[u8]>) -> Vec<u8> {
@@ -68,9 +75,15 @@ fn handle_command(
             drop(state);
             stream.write(&serialize_to_bulkstring(value.as_deref()))?
         }
-        Command::Set(key, value) => {
+        Command::Set { key, value, expiry } => {
             let mut state = state.lock().unwrap();
-            state.set(key, value);
+            state.set(key, value, expiry);
+            println!(
+                "DEBUG: setting key {:?} value {:?} with expiry {:?}",
+                std::str::from_utf8(key),
+                std::str::from_utf8(value),
+                expiry
+            );
             drop(state);
             stream.write(&serialize_to_simplestring(b"OK"))?
         }
@@ -78,12 +91,11 @@ fn handle_command(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn bytes_to_unsigned(bytes: &[u8]) -> Option<u32> {
+fn bytes_to_unsigned(bytes: &[u8]) -> Option<u64> {
     let mut integer = 0;
     for digit in bytes {
         if digit.is_ascii_digit() {
-            integer = integer * 10 + (digit - b'0') as u32;
+            integer = integer * 10 + (digit - b'0') as u64;
         } else {
             return None;
         }
@@ -98,7 +110,7 @@ fn parse_message(message: &[u8]) -> Option<Command> {
     match message.first() {
         Some(b'*') => {
             let message = std::str::from_utf8(message).unwrap();
-            println!("Started parsing message {:?}", message);
+            println!("INFO: started parsing message {:?}", message);
 
             let segments = message.split("\r\n").collect::<Vec<_>>();
             if segments[2].eq_ignore_ascii_case("ping") {
@@ -108,7 +120,17 @@ fn parse_message(message: &[u8]) -> Option<Command> {
             } else if segments[2].eq_ignore_ascii_case("get") {
                 Some(Command::Get(segments[4].as_bytes()))
             } else if segments[2].eq_ignore_ascii_case("set") {
-                Some(Command::Set(segments[4].as_bytes(), segments[6].as_bytes()))
+                Some(Command::Set {
+                    key: segments[4].as_bytes(),
+                    value: segments[6].as_bytes(),
+                    expiry: if segments.len() > 8 && segments[8].eq_ignore_ascii_case("px") {
+                        Some(Duration::from_millis(
+                            bytes_to_unsigned(segments[10].as_bytes()).unwrap(),
+                        ))
+                    } else {
+                        None
+                    },
+                })
             } else {
                 None
             }

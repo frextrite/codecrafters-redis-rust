@@ -51,6 +51,7 @@ enum Command<'a> {
         #[allow(dead_code)]
         expiry: Option<Duration>,
     },
+    Info(&'a [u8]),
 }
 
 fn serialize_to_bulkstring(data: Option<&[u8]>) -> Vec<u8> {
@@ -95,6 +96,10 @@ fn handle_command(
             drop(state);
             stream.write(&serialize_to_simplestring(b"OK"))?
         }
+        Command::Info(section) => match std::str::from_utf8(section).unwrap() {
+            "replication" => stream.write(&serialize_to_bulkstring(Some(b"role:master")))?,
+            _ => panic!("Not expecting to receive section other than replication"),
+        },
     };
     Ok(())
 }
@@ -139,6 +144,8 @@ fn parse_message(message: &[u8]) -> Option<Command> {
                         None
                     },
                 })
+            } else if segments[2].eq_ignore_ascii_case("info") {
+                Some(Command::Info(segments[4].as_bytes()))
             } else {
                 None
             }

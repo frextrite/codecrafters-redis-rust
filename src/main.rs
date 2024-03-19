@@ -4,14 +4,22 @@ use std::str;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use clap::Parser;
 use redis_starter_rust::state;
 
-const ADDR: &str = "127.0.0.1:6379";
+const HOST: &str = "127.0.0.1";
 #[allow(dead_code)]
 const CR: u8 = b'\r';
 #[allow(dead_code)]
 const LF: u8 = b'\n';
 const CRLF: &str = "\r\n";
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[arg(short, long, default_value_t = 6379)]
+    port: u16,
+}
 
 struct State {
     store: state::ExpiringHashMap,
@@ -184,9 +192,11 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io
 }
 
 fn main() {
-    let listener = TcpListener::bind(ADDR).unwrap();
+    let args = Cli::parse();
+    let addr = (HOST, args.port);
+    let listener = TcpListener::bind(addr).unwrap();
 
-    println!("INFO: started listener on {:?}", ADDR);
+    println!("INFO: started listener on {:?}", addr);
 
     let state = Arc::new(Mutex::new(State::new()));
     for incoming_stream in listener.incoming() {

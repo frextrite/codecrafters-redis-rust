@@ -24,7 +24,11 @@ struct Cli {
 }
 
 #[derive(Debug)]
-struct MasterInfo {}
+struct MasterInfo {
+    replication_id: String,
+    replication_offset: u64,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 struct SlaveInfo {
@@ -44,10 +48,15 @@ struct ServerMetadata {
 }
 
 impl ServerMetadata {
-    fn get_replica_info(&self) -> &[u8] {
+    fn get_replica_info(&self) -> Vec<u8> {
         match &self.replica_info {
-            ReplicaInfo::Master(_master_info) => b"role:master",
-            ReplicaInfo::Slave(_slave_info) => b"role:slave",
+            ReplicaInfo::Master(master_info) => format!(
+                "role:master{CRLF}master_replid:{}{CRLF}master_repl_offset:{}",
+                master_info.replication_id, master_info.replication_offset
+            )
+            .as_bytes()
+            .to_vec(),
+            ReplicaInfo::Slave(_slave_info) => b"role:slave".to_vec(),
         }
     }
 }
@@ -129,7 +138,7 @@ fn handle_command(
         }
         Command::Info(section) => match std::str::from_utf8(section).unwrap() {
             "replication" => stream.write_all(&serialize_to_bulkstring(Some(
-                state.metadata.get_replica_info(),
+                &state.metadata.get_replica_info(),
             )))?,
             _ => panic!("Not expecting to receive section other than replication"),
         },
@@ -243,14 +252,17 @@ fn generate_server_metadata(replica_info: Option<Vec<String>>) -> ServerMetadata
             }
         }
         None => ServerMetadata {
-            replica_info: ReplicaInfo::Master(MasterInfo {}),
+            replica_info: ReplicaInfo::Master(MasterInfo {
+                replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
+                replication_offset: 0,
+            }),
         },
     }
 }
 
 fn main() {
     let args = Cli::parse();
-    println!("{:?}", args);
+    println!("DEBUG: parsed cli args: {:?}", args);
     let addr = (HOST, args.port);
     let listener = TcpListener::bind(addr).unwrap();
 

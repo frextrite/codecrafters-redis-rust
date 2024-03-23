@@ -96,6 +96,13 @@ enum Command<'a> {
     Info(&'a [u8]),
 }
 
+// TODO: avoid extra copies
+fn serialize_to_array(data: &[&[u8]]) -> Vec<u8> {
+    let count = data.len();
+    let data = data.iter().flat_map(|&x| x).copied().collect::<Vec<u8>>();
+    format!("*{}{CRLF}{}", count, std::str::from_utf8(&data).unwrap()).into_bytes()
+}
+
 fn serialize_to_bulkstring(data: Option<&[u8]>) -> Vec<u8> {
     match data {
         Some(bytes) => format!(
@@ -240,6 +247,32 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Resul
     Ok(())
 }
 
+fn initiate_replication(metadata: &ServerMetadata) {
+    match &metadata.replica_info {
+        ReplicaInfo::Slave(info) => {
+            let host = info.master_host.clone();
+            let port = info.master_port;
+            println!("INFO: connection to master at {}:{}", &host, port);
+            std::thread::spawn(move || match TcpStream::connect((host, port)) {
+                Ok(mut stream) => {
+                    // TODO: Use Vec instead of a slice since the array size cannot be known at compile time for generic arrays
+                    let ping_req = serialize_to_array(&[&serialize_to_bulkstring(Some(b"PING"))]);
+                    println!(
+                        "INFO: sending replication ping request {:?}",
+                        std::str::from_utf8(&ping_req).unwrap(),
+                    );
+                    stream.write_all(&ping_req).unwrap();
+                }
+                Err(err) => println!(
+                    "ERROR: failed to connect to master with error: \"{:?}\"",
+                    err
+                ),
+            });
+        }
+        ReplicaInfo::Master(_) => println!("ERROR: replication not implemented for master"),
+    }
+}
+
 fn generate_server_metadata(replica_info: Option<Vec<String>>) -> ServerMetadata {
     match replica_info {
         Some(info) => {
@@ -269,7 +302,9 @@ fn main() {
     println!("INFO: started listener on {:?}", addr);
 
     let metadata = generate_server_metadata(args.replicaof);
+    initiate_replication(&metadata);
     let state = Arc::new(State::new(metadata));
+
     for incoming_stream in listener.incoming() {
         match incoming_stream {
             Ok(stream) => {

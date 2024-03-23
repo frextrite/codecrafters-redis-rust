@@ -19,25 +19,58 @@ const CRLF: &str = "\r\n";
 struct Cli {
     #[arg(short, long, default_value_t = 6379)]
     port: u16,
+    #[arg(short, long, num_args = 2)]
+    replicaof: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+struct MasterInfo {}
+#[derive(Debug)]
+#[allow(dead_code)]
+struct SlaveInfo {
+    master_host: String,
+    master_port: u16,
+}
+
+#[derive(Debug)]
+enum ReplicaInfo {
+    Master(MasterInfo),
+    Slave(SlaveInfo),
+}
+
+#[derive(Debug)]
+struct ServerMetadata {
+    replica_info: ReplicaInfo,
+}
+
+impl ServerMetadata {
+    fn get_replica_info(&self) -> &[u8] {
+        match &self.replica_info {
+            ReplicaInfo::Master(_master_info) => b"role:master",
+            ReplicaInfo::Slave(_slave_info) => b"role:slave",
+        }
+    }
 }
 
 struct State {
-    store: state::ExpiringHashMap,
+    metadata: ServerMetadata,
+    store: Mutex<state::ExpiringHashMap>,
 }
 
 impl State {
-    fn new() -> State {
+    fn new(metadata: ServerMetadata) -> State {
         State {
-            store: state::ExpiringHashMap::new(),
+            metadata,
+            store: Mutex::new(state::ExpiringHashMap::new()),
         }
     }
 
-    fn set(&mut self, key: &[u8], value: &[u8], expiry: Option<Duration>) {
-        self.store.set(key, value, expiry);
+    fn set(&self, key: &[u8], value: &[u8], expiry: Option<Duration>) {
+        self.store.lock().unwrap().set(key, value, expiry);
     }
 
-    fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-        self.store.get(key)
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.store.lock().unwrap().get(key)
     }
 }
 
@@ -73,19 +106,17 @@ fn serialize_to_simplestring(data: &[u8]) -> Vec<u8> {
 fn handle_command(
     command: Command,
     stream: &mut TcpStream,
-    state: Arc<Mutex<State>>,
+    state: Arc<State>,
 ) -> std::io::Result<()> {
     match command {
-        Command::Ping => stream.write(&serialize_to_simplestring(b"PONG"))?,
-        Command::Echo(data) => stream.write(&serialize_to_bulkstring(Some(data)))?,
+        Command::Ping => stream.write_all(&serialize_to_simplestring(b"PONG"))?,
+        Command::Echo(data) => stream.write_all(&serialize_to_bulkstring(Some(data)))?,
         Command::Get(key) => {
-            let mut state = state.lock().unwrap();
             let value = state.get(key).map(|v| v.to_vec());
             drop(state);
-            stream.write(&serialize_to_bulkstring(value.as_deref()))?
+            stream.write_all(&serialize_to_bulkstring(value.as_deref()))?
         }
         Command::Set { key, value, expiry } => {
-            let mut state = state.lock().unwrap();
             state.set(key, value, expiry);
             println!(
                 "DEBUG: setting key {:?} value {:?} with expiry {:?}",
@@ -94,10 +125,12 @@ fn handle_command(
                 expiry
             );
             drop(state);
-            stream.write(&serialize_to_simplestring(b"OK"))?
+            stream.write_all(&serialize_to_simplestring(b"OK"))?
         }
         Command::Info(section) => match std::str::from_utf8(section).unwrap() {
-            "replication" => stream.write(&serialize_to_bulkstring(Some(b"role:master")))?,
+            "replication" => stream.write_all(&serialize_to_bulkstring(Some(
+                state.metadata.get_replica_info(),
+            )))?,
             _ => panic!("Not expecting to receive section other than replication"),
         },
     };
@@ -162,7 +195,7 @@ fn parse_message(message: &[u8]) -> Option<Command> {
 // calls to read() are required to read an entire command.
 // TODO: handle the above scenario in which multiple calls to read() are required to obtain a
 // single command
-fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io::Result<()> {
+fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()> {
     let mut buf = [0; 1024];
     loop {
         match stream.read(&mut buf) {
@@ -198,14 +231,33 @@ fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) -> std::io
     Ok(())
 }
 
+fn generate_server_metadata(replica_info: Option<Vec<String>>) -> ServerMetadata {
+    match replica_info {
+        Some(info) => {
+            assert_eq!(info.len(), 2);
+            ServerMetadata {
+                replica_info: ReplicaInfo::Slave(SlaveInfo {
+                    master_host: info[0].clone(),
+                    master_port: info[1].parse().unwrap(),
+                }),
+            }
+        }
+        None => ServerMetadata {
+            replica_info: ReplicaInfo::Master(MasterInfo {}),
+        },
+    }
+}
+
 fn main() {
     let args = Cli::parse();
+    println!("{:?}", args);
     let addr = (HOST, args.port);
     let listener = TcpListener::bind(addr).unwrap();
 
     println!("INFO: started listener on {:?}", addr);
 
-    let state = Arc::new(Mutex::new(State::new()));
+    let metadata = generate_server_metadata(args.replicaof);
+    let state = Arc::new(State::new(metadata));
     for incoming_stream in listener.incoming() {
         match incoming_stream {
             Ok(stream) => {

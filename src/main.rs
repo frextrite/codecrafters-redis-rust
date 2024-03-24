@@ -95,6 +95,7 @@ enum Command<'a> {
         expiry: Option<Duration>,
     },
     Info(&'a [u8]),
+    ReplConf,
 }
 
 // TODO: avoid extra copies
@@ -150,6 +151,7 @@ fn handle_command(
             )))?,
             _ => panic!("Not expecting to receive section other than replication"),
         },
+        Command::ReplConf => stream.write_all(&serialize_to_simplestring(b"OK"))?,
     };
     Ok(())
 }
@@ -196,6 +198,8 @@ fn parse_message(message: &[u8]) -> Option<Command> {
                 })
             } else if segments[2].eq_ignore_ascii_case("info") {
                 Some(Command::Info(segments[4].as_bytes()))
+            } else if segments[2].eq_ignore_ascii_case("replconf") {
+                Some(Command::ReplConf)
             } else {
                 None
             }

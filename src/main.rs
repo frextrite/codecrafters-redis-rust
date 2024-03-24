@@ -258,10 +258,39 @@ fn read_single_message(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(buf[..n].to_vec())
 }
 
+fn validate_received_resp(resp: &[u8], expected_data: &str) {
+    if let Ordering::Equal = cmp_simple_strings(resp, expected_data.as_bytes()) {
+    } else {
+        panic!(
+            "Received {:?} from master but {:?} was expected",
+            std::str::from_utf8(resp).unwrap(),
+            expected_data,
+        );
+    }
+}
+
+fn send_req_and_receive_resp(
+    req: &[u8],
+    stream: &mut TcpStream,
+    command: &str,
+) -> std::io::Result<Vec<u8>> {
+    println!(
+        "INFO: sending {} request {:?}",
+        command,
+        std::str::from_utf8(req).unwrap()
+    );
+    stream.write_all(req)?;
+
+    let resp = read_single_message(stream)?;
+    println!(
+        "DEBUG: received {:?} from master",
+        std::str::from_utf8(&resp).unwrap()
+    );
+
+    Ok(resp)
+}
+
 fn initiate_replication_as_slave(host: String, port: u16, host_port: u16) -> std::io::Result<()> {
-    // checking correctness of the response is not mandated, but setting this value to `true` matches the
-    // received response to the expected data and testing indicates this is working perfectly
-    let wait_for_inline_acks = true;
     println!("INFO: connecting to master at {}:{}", &host, port);
     {
         let mut stream = TcpStream::connect((host, port))?;
@@ -269,25 +298,8 @@ fn initiate_replication_as_slave(host: String, port: u16, host_port: u16) -> std
         // Step 1: Send PING
         // TODO: Use Vec instead of a slice since the array size cannot be known at compile time for generic arrays
         let ping_req = serialize_to_array(&[&serialize_to_bulkstring(Some(b"PING"))]);
-        println!(
-            "INFO: sending replication ping request {:?}",
-            std::str::from_utf8(&ping_req).unwrap(),
-        );
-        stream.write_all(&ping_req).unwrap();
-
-        // Receive and process ACK (PONG)
-        if wait_for_inline_acks {
-            let resp = read_single_message(&mut stream)?;
-            let expected = "PONG";
-            if let Ordering::Equal = cmp_simple_strings(&resp, expected.as_bytes()) {
-            } else {
-                panic!(
-                    "Received {:?} from master but {:?} was expected",
-                    std::str::from_utf8(&resp).unwrap(),
-                    expected,
-                );
-            }
-        }
+        let resp = send_req_and_receive_resp(&ping_req, &mut stream, "PING")?;
+        validate_received_resp(&resp, "PONG");
 
         // Step 2: Send REPLCONF messages
         // Step 2.1: Send REPLCONF with listening-port information
@@ -296,25 +308,8 @@ fn initiate_replication_as_slave(host: String, port: u16, host_port: u16) -> std
             &serialize_to_bulkstring(Some(b"listening-port")),
             &serialize_to_bulkstring(Some(host_port.to_string().as_bytes())),
         ]);
-        println!(
-            "INFO: sending replication REPLCONF request with listening port information {:?}",
-            std::str::from_utf8(&repl_conf_port_req).unwrap()
-        );
-        stream.write_all(&repl_conf_port_req).unwrap();
-
-        // Receive and process ACK (OK)
-        if wait_for_inline_acks {
-            let resp = read_single_message(&mut stream)?;
-            let expected = "OK";
-            if let Ordering::Equal = cmp_simple_strings(&resp, expected.as_bytes()) {
-            } else {
-                panic!(
-                    "Received {:?} from master but {:?} was expected",
-                    std::str::from_utf8(&resp).unwrap(),
-                    expected,
-                );
-            }
-        }
+        let resp = send_req_and_receive_resp(&repl_conf_port_req, &mut stream, "REPLCONF")?;
+        validate_received_resp(&resp, "OK");
 
         // Step 2.2: Send REPLCONF with capabilities information
         let repl_conf_capa_req = serialize_to_array(&[
@@ -322,25 +317,16 @@ fn initiate_replication_as_slave(host: String, port: u16, host_port: u16) -> std
             &serialize_to_bulkstring(Some(b"capa")),
             &serialize_to_bulkstring(Some(b"psync2")),
         ]);
-        println!(
-            "INFO: sending replication REPLCONF request with capabilities information {:?}",
-            std::str::from_utf8(&repl_conf_capa_req).unwrap(),
-        );
-        stream.write_all(&repl_conf_capa_req).unwrap();
+        let resp = send_req_and_receive_resp(&repl_conf_capa_req, &mut stream, "REPLCONF")?;
+        validate_received_resp(&resp, "OK");
 
-        // Receive and process ACK (OK)
-        if wait_for_inline_acks {
-            let resp = read_single_message(&mut stream)?;
-            let expected = "OK";
-            if let Ordering::Equal = cmp_simple_strings(&resp, expected.as_bytes()) {
-            } else {
-                panic!(
-                    "Received {:?} from master but {:?} was expected",
-                    std::str::from_utf8(&resp).unwrap(),
-                    expected,
-                );
-            }
-        }
+        // Step 3: Send PSYNC message
+        let psync_req = serialize_to_array(&[
+            &serialize_to_bulkstring(Some(b"PSYNC")),
+            &serialize_to_bulkstring(Some(b"?")),
+            &serialize_to_bulkstring(Some(b"-1")),
+        ]);
+        let _ = send_req_and_receive_resp(&psync_req, &mut stream, "PSYNC")?;
     }
     println!("INFO: successfully initiated replication for slave");
     Ok(())

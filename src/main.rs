@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::str;
@@ -247,26 +248,111 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Resul
     Ok(())
 }
 
-fn initiate_replication(metadata: &ServerMetadata) {
+fn cmp_simple_strings(received: &[u8], expected_data: &[u8]) -> Ordering {
+    received.cmp(&serialize_to_simplestring(expected_data))
+}
+
+fn read_single_message(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut buf = [0; 512];
+    let n = stream.read(&mut buf)?;
+    Ok(buf[..n].to_vec())
+}
+
+fn initiate_replication_as_slave(host: String, port: u16, host_port: u16) -> std::io::Result<()> {
+    // checking correctness of the response is not mandated, but setting this value to `true` matches the
+    // received response to the expected data and testing indicates this is working perfectly
+    let wait_for_inline_acks = true;
+    println!("INFO: connecting to master at {}:{}", &host, port);
+    {
+        let mut stream = TcpStream::connect((host, port))?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        // Step 1: Send PING
+        // TODO: Use Vec instead of a slice since the array size cannot be known at compile time for generic arrays
+        let ping_req = serialize_to_array(&[&serialize_to_bulkstring(Some(b"PING"))]);
+        println!(
+            "INFO: sending replication ping request {:?}",
+            std::str::from_utf8(&ping_req).unwrap(),
+        );
+        stream.write_all(&ping_req).unwrap();
+
+        // Receive and process ACK (PONG)
+        if wait_for_inline_acks {
+            let resp = read_single_message(&mut stream)?;
+            let expected = "PONG";
+            if let Ordering::Equal = cmp_simple_strings(&resp, expected.as_bytes()) {
+            } else {
+                panic!(
+                    "Received {:?} from master but {:?} was expected",
+                    std::str::from_utf8(&resp).unwrap(),
+                    expected,
+                );
+            }
+        }
+
+        // Step 2: Send REPLCONF messages
+        // Step 2.1: Send REPLCONF with listening-port information
+        let repl_conf_port_req = serialize_to_array(&[
+            &serialize_to_bulkstring(Some(b"REPLCONF")),
+            &serialize_to_bulkstring(Some(b"listening-port")),
+            &serialize_to_bulkstring(Some(host_port.to_string().as_bytes())),
+        ]);
+        println!(
+            "INFO: sending replication REPLCONF request with listening port information {:?}",
+            std::str::from_utf8(&repl_conf_port_req).unwrap()
+        );
+        stream.write_all(&repl_conf_port_req).unwrap();
+
+        // Receive and process ACK (OK)
+        if wait_for_inline_acks {
+            let resp = read_single_message(&mut stream)?;
+            let expected = "OK";
+            if let Ordering::Equal = cmp_simple_strings(&resp, expected.as_bytes()) {
+            } else {
+                panic!(
+                    "Received {:?} from master but {:?} was expected",
+                    std::str::from_utf8(&resp).unwrap(),
+                    expected,
+                );
+            }
+        }
+
+        // Step 2.2: Send REPLCONF with capabilities information
+        let repl_conf_capa_req = serialize_to_array(&[
+            &serialize_to_bulkstring(Some(b"REPLCONF")),
+            &serialize_to_bulkstring(Some(b"capa")),
+            &serialize_to_bulkstring(Some(b"psync2")),
+        ]);
+        println!(
+            "INFO: sending replication REPLCONF request with capabilities information {:?}",
+            std::str::from_utf8(&repl_conf_capa_req).unwrap(),
+        );
+        stream.write_all(&repl_conf_capa_req).unwrap();
+
+        // Receive and process ACK (OK)
+        if wait_for_inline_acks {
+            let resp = read_single_message(&mut stream)?;
+            let expected = "OK";
+            if let Ordering::Equal = cmp_simple_strings(&resp, expected.as_bytes()) {
+            } else {
+                panic!(
+                    "Received {:?} from master but {:?} was expected",
+                    std::str::from_utf8(&resp).unwrap(),
+                    expected,
+                );
+            }
+        }
+    }
+    println!("INFO: successfully initiated replication for slave");
+    Ok(())
+}
+
+fn initiate_replication(metadata: &ServerMetadata, host_port: u16) {
     match &metadata.replica_info {
         ReplicaInfo::Slave(info) => {
             let host = info.master_host.clone();
             let port = info.master_port;
-            println!("INFO: connection to master at {}:{}", &host, port);
-            std::thread::spawn(move || match TcpStream::connect((host, port)) {
-                Ok(mut stream) => {
-                    // TODO: Use Vec instead of a slice since the array size cannot be known at compile time for generic arrays
-                    let ping_req = serialize_to_array(&[&serialize_to_bulkstring(Some(b"PING"))]);
-                    println!(
-                        "INFO: sending replication ping request {:?}",
-                        std::str::from_utf8(&ping_req).unwrap(),
-                    );
-                    stream.write_all(&ping_req).unwrap();
-                }
-                Err(err) => println!(
-                    "ERROR: failed to connect to master with error: \"{:?}\"",
-                    err
-                ),
+            std::thread::spawn(move || {
+                initiate_replication_as_slave(host, port, host_port).unwrap();
             });
         }
         ReplicaInfo::Master(_) => println!("ERROR: replication not implemented for master"),
@@ -302,7 +388,7 @@ fn main() {
     println!("INFO: started listener on {:?}", addr);
 
     let metadata = generate_server_metadata(args.replicaof);
-    initiate_replication(&metadata);
+    initiate_replication(&metadata, args.port);
     let state = Arc::new(State::new(metadata));
 
     for incoming_stream in listener.incoming() {

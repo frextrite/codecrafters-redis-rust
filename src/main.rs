@@ -96,6 +96,7 @@ enum Command<'a> {
     },
     Info(&'a [u8]),
     ReplConf,
+    Psync,
 }
 
 // TODO: avoid extra copies
@@ -152,6 +153,17 @@ fn handle_command(
             _ => panic!("Not expecting to receive section other than replication"),
         },
         Command::ReplConf => stream.write_all(&serialize_to_simplestring(b"OK"))?,
+        Command::Psync => {
+            if let ReplicaInfo::Master(info) = &state.metadata.replica_info {
+                let payload = format!(
+                    "FULLRESYNC {} {}",
+                    info.replication_id, info.replication_offset
+                );
+                stream.write_all(&serialize_to_simplestring(payload.as_bytes()))?;
+            } else {
+                panic!("PSYNC not supported on slave")
+            }
+        }
     };
     Ok(())
 }
@@ -200,6 +212,8 @@ fn parse_message(message: &[u8]) -> Option<Command> {
                 Some(Command::Info(segments[4].as_bytes()))
             } else if segments[2].eq_ignore_ascii_case("replconf") {
                 Some(Command::ReplConf)
+            } else if segments[2].eq_ignore_ascii_case("psync") {
+                Some(Command::Psync)
             } else {
                 None
             }

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
+use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
 use redis_starter_rust::state;
 
 const HOST: &str = "127.0.0.1";
@@ -160,6 +161,9 @@ fn handle_command(
                     info.replication_id, info.replication_offset
                 );
                 stream.write_all(&serialize_to_simplestring(payload.as_bytes()))?;
+                let rdb_payload = serialize_rdb(&get_empty_rdb());
+                println!("DEBUG: sending RDB payload (as hex): {:x?}", &rdb_payload);
+                stream.write_all(&rdb_payload)?;
             } else {
                 panic!("PSYNC not supported on slave")
             }
@@ -359,7 +363,7 @@ fn initiate_replication(metadata: &ServerMetadata, host_port: u16) {
                 initiate_replication_as_slave(host, port, host_port).unwrap();
             });
         }
-        ReplicaInfo::Master(_) => println!("ERROR: replication not implemented for master"),
+        ReplicaInfo::Master(_) => println!("WARN: replication not implemented for master"),
     }
 }
 

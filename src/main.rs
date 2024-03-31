@@ -1,12 +1,14 @@
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::ops::Deref;
 use std::str;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
 use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
+use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
 use redis_starter_rust::state;
 
 const HOST: &str = "127.0.0.1";
@@ -65,6 +67,7 @@ impl ServerMetadata {
 
 struct State {
     metadata: ServerMetadata,
+    replica_manager: Mutex<ReplicaManager>,
     store: Mutex<state::ExpiringHashMap>,
 }
 
@@ -72,6 +75,7 @@ impl State {
     fn new(metadata: ServerMetadata) -> State {
         State {
             metadata,
+            replica_manager: Mutex::new(ReplicaManager::new()),
             store: Mutex::new(state::ExpiringHashMap::new()),
         }
     }
@@ -85,6 +89,7 @@ impl State {
     }
 }
 
+#[derive(Debug)]
 enum Command<'a> {
     Ping,
     Echo(&'a [u8]),
@@ -124,7 +129,7 @@ fn serialize_to_simplestring(data: &[u8]) -> Vec<u8> {
 }
 
 fn handle_command(
-    command: Command,
+    command: &Command,
     stream: &mut TcpStream,
     state: Arc<State>,
 ) -> std::io::Result<()> {
@@ -133,19 +138,21 @@ fn handle_command(
         Command::Echo(data) => stream.write_all(&serialize_to_bulkstring(Some(data)))?,
         Command::Get(key) => {
             let value = state.get(key).map(|v| v.to_vec());
-            drop(state);
             stream.write_all(&serialize_to_bulkstring(value.as_deref()))?
         }
         Command::Set { key, value, expiry } => {
-            state.set(key, value, expiry);
+            state.set(key, value, *expiry);
             println!(
                 "DEBUG: setting key {:?} value {:?} with expiry {:?}",
                 std::str::from_utf8(key),
                 std::str::from_utf8(value),
                 expiry
             );
-            drop(state);
-            stream.write_all(&serialize_to_simplestring(b"OK"))?
+            // TODO: Only send reply if we are master, and not if we are a replica receiving
+            // replicated commands and make this generic instead of adding if conditions
+            if let ReplicaInfo::Master(_) = state.metadata.replica_info {
+                stream.write_all(&serialize_to_simplestring(b"OK"))?
+            }
         }
         Command::Info(section) => match std::str::from_utf8(section).unwrap() {
             "replication" => stream.write_all(&serialize_to_bulkstring(Some(
@@ -164,6 +171,9 @@ fn handle_command(
                 let rdb_payload = serialize_rdb(&get_empty_rdb());
                 println!("DEBUG: sending RDB payload (as hex): {:x?}", &rdb_payload);
                 stream.write_all(&rdb_payload)?;
+
+                let replica = Replica::new(stream.try_clone().unwrap());
+                state.replica_manager.lock().unwrap().add_replica(replica);
             } else {
                 panic!("PSYNC not supported on slave")
             }
@@ -230,6 +240,39 @@ fn parse_message(message: &[u8]) -> Option<Command> {
     }
 }
 
+fn can_replicate_command(command: &Command) -> bool {
+    matches!(command, Command::Set { .. })
+}
+
+fn handle_command_replication(command: &Command, message: &[u8], state: &State) {
+    if can_replicate_command(command) {
+        println!(
+            "DEBUG: replicating command {:?} with contents {:?}",
+            command, message
+        );
+        state
+            .replica_manager
+            .lock()
+            .unwrap()
+            .propagate_message_to_replicas(message);
+    }
+}
+
+fn handle_client_disconnect(stream: &TcpStream, state: &State) {
+    if state
+        .replica_manager
+        .lock()
+        .unwrap()
+        .remove_replica(stream.peer_addr().unwrap())
+        .is_some()
+    {
+        println!(
+            "INFO: successfully removed {:?} as a replica listener",
+            stream.peer_addr(),
+        );
+    }
+}
+
 // TcpStream::read() is *not* guaranteed to return the entire command, which means multiple
 // calls to read() are required to read an entire command.
 // TODO: handle the above scenario in which multiple calls to read() are required to obtain a
@@ -250,7 +293,12 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Resul
                     break;
                 }
                 match parse_message(message) {
-                    Some(command) => handle_command(command, &mut stream, state.clone())?,
+                    Some(command) => {
+                        handle_command(&command, &mut stream, state.clone())?;
+                        if let ReplicaInfo::Master(_) = state.metadata.replica_info {
+                            handle_command_replication(&command, message, state.deref());
+                        }
+                    }
                     None => eprintln!("ERROR: failed to parse message {:?}", message),
                 }
             }
@@ -266,6 +314,14 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Resul
                 }
             }
         }
+    }
+    // TOOD: Instead of calling remove_replica unconditionally, propagate replica status for the client here
+    // and only make remove_replica call if the client is actively replicating
+    //
+    // We cannot know whether there is atleast one replica listening for commands since this
+    // information is only known by replication sub-system, hence propagate all commands
+    if let ReplicaInfo::Master(_) = state.metadata.replica_info {
+        handle_client_disconnect(&stream, state.deref());
     }
     Ok(())
 }
@@ -312,7 +368,12 @@ fn send_req_and_receive_resp(
     Ok(resp)
 }
 
-fn initiate_replication_as_slave(host: String, port: u16, host_port: u16) -> std::io::Result<()> {
+fn initiate_replication_as_slave(
+    host: String,
+    port: u16,
+    host_port: u16,
+    state: Arc<State>,
+) -> std::io::Result<()> {
     println!("INFO: connecting to master at {}:{}", &host, port);
     {
         let mut stream = TcpStream::connect((host, port))?;
@@ -349,18 +410,22 @@ fn initiate_replication_as_slave(host: String, port: u16, host_port: u16) -> std
             &serialize_to_bulkstring(Some(b"-1")),
         ]);
         let _ = send_req_and_receive_resp(&psync_req, &mut stream, "PSYNC")?;
+
+        println!("INFO: successfully initiated replication for slave");
+
+        // Start replication
+        handle_connection(stream, state)?;
     }
-    println!("INFO: successfully initiated replication for slave");
     Ok(())
 }
 
-fn initiate_replication(metadata: &ServerMetadata, host_port: u16) {
-    match &metadata.replica_info {
+fn initiate_replication(state: Arc<State>, host_port: u16) {
+    match &state.metadata.replica_info {
         ReplicaInfo::Slave(info) => {
             let host = info.master_host.clone();
             let port = info.master_port;
             std::thread::spawn(move || {
-                initiate_replication_as_slave(host, port, host_port).unwrap();
+                initiate_replication_as_slave(host, port, host_port, state).unwrap();
             });
         }
         ReplicaInfo::Master(_) => println!("WARN: replication not implemented for master"),
@@ -396,8 +461,8 @@ fn main() {
     println!("INFO: started listener on {:?}", addr);
 
     let metadata = generate_server_metadata(args.replicaof);
-    initiate_replication(&metadata, args.port);
     let state = Arc::new(State::new(metadata));
+    initiate_replication(state.clone(), args.port);
 
     for incoming_stream in listener.incoming() {
         match incoming_stream {

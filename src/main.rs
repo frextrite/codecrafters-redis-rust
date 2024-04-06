@@ -93,23 +93,6 @@ impl State {
     }
 }
 
-/*
-#[derive(Debug)]
-enum Command<'a> {
-    Ping,
-    Echo(&'a [u8]),
-    Get(&'a [u8]),
-    Set {
-        key: &'a [u8],
-        value: &'a [u8],
-        #[allow(dead_code)]
-        expiry: Option<Duration>,
-    },
-    Info(&'a [u8]),
-    ReplConf,
-    Psync,
-}*/
-
 // TODO: avoid extra copies
 fn serialize_to_array(data: &[&[u8]]) -> Vec<u8> {
     let count = data.len();
@@ -187,51 +170,6 @@ fn handle_command(
     Ok(())
 }
 
-// This only works with "correct" clients since it does not check for the correctness of the
-// commands, and assumes that the client will send the correct number of arguments.
-/*fn parse_message(message: &[u8]) -> Option<Command> {
-    match message.first() {
-        Some(b'*') => {
-            let message = std::str::from_utf8(message).unwrap();
-            println!("INFO: started parsing message {:?}", message);
-
-            let segments = message.split("\r\n").collect::<Vec<_>>();
-            if segments[2].eq_ignore_ascii_case("ping") {
-                Some(Command::Ping)
-            } else if segments[2].eq_ignore_ascii_case("echo") {
-                Some(Command::Echo(segments[4].as_bytes()))
-            } else if segments[2].eq_ignore_ascii_case("get") {
-                Some(Command::Get(segments[4].as_bytes()))
-            } else if segments[2].eq_ignore_ascii_case("set") {
-                Some(Command::Set {
-                    key: segments[4].as_bytes(),
-                    value: segments[6].as_bytes(),
-                    expiry: if segments.len() > 8 && segments[8].eq_ignore_ascii_case("px") {
-                        Some(Duration::from_millis(
-                            bytes_to_unsigned(segments[10].as_bytes()).unwrap(),
-                        ))
-                    } else {
-                        None
-                    },
-                })
-            } else if segments[2].eq_ignore_ascii_case("info") {
-                Some(Command::Info(segments[4].as_bytes()))
-            } else if segments[2].eq_ignore_ascii_case("replconf") {
-                Some(Command::ReplConf)
-            } else if segments[2].eq_ignore_ascii_case("psync") {
-                Some(Command::Psync)
-            } else {
-                None
-            }
-        }
-        Some(byte) => unimplemented!(
-            "INFO: Found redis command starting with byte {}",
-            byte.to_ascii_lowercase()
-        ),
-        None => None,
-    }
-}*/
-
 fn can_replicate_command(command: &Command) -> bool {
     matches!(command, Command::Set { .. })
 }
@@ -298,10 +236,6 @@ fn try_handle_message(
     Ok(())
 }
 
-// TcpStream::read() is *not* guaranteed to return the entire command, which means multiple
-// calls to read() are required to read an entire command.
-// TODO: handle the above scenario in which multiple calls to read() are required to obtain a
-// single command
 fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()> {
     let mut buf = [0; 1024];
     let mut offset = 0;

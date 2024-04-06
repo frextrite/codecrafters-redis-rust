@@ -58,6 +58,9 @@ impl From<ParseIntError> for ParseError {
 }
 
 pub fn find_first_crlf(message: &[u8]) -> Option<usize> {
+    if message.len() < 2 {
+        return None;
+    }
     (0..message.len() - 1).find(|&i| message[i] == CR && message[i + 1] == LF)
 }
 

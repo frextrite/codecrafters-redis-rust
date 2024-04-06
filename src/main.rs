@@ -1,10 +1,10 @@
 use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::str;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use redis_starter_rust::parser::command::{parse_command, Command};
@@ -69,17 +69,43 @@ impl ServerMetadata {
     }
 }
 
+struct MasterLiveData;
+struct SlaveLiveData {
+    offset: usize,
+    heartbeat_recv_time: Option<Instant>,
+}
+
+enum LiveData {
+    Master(MasterLiveData),
+    Slave(SlaveLiveData),
+}
+
+impl LiveData {
+    fn new(info: &ReplicaInfo) -> LiveData {
+        match info {
+            ReplicaInfo::Master(..) => LiveData::Master(MasterLiveData),
+            ReplicaInfo::Slave(..) => LiveData::Slave(SlaveLiveData {
+                offset: 0,
+                heartbeat_recv_time: None,
+            }),
+        }
+    }
+}
+
 struct State {
     metadata: ServerMetadata,
     replica_manager: Mutex<ReplicaManager>,
+    live_data: Mutex<LiveData>,
     store: Mutex<state::ExpiringHashMap>,
 }
 
 impl State {
     fn new(metadata: ServerMetadata) -> State {
+        let live_data = Mutex::new(LiveData::new(&metadata.replica_info));
         State {
             metadata,
             replica_manager: Mutex::new(ReplicaManager::new()),
+            live_data,
             store: Mutex::new(state::ExpiringHashMap::new()),
         }
     }
@@ -122,7 +148,13 @@ fn handle_command(
     state: Arc<State>,
 ) -> std::io::Result<()> {
     match command {
-        Command::Ping => stream.write_all(&serialize_to_simplestring(b"PONG"))?,
+        Command::Ping => {
+            if let ReplicaInfo::Master(_) = state.metadata.replica_info {
+                stream.write_all(&serialize_to_simplestring(b"PONG"))?
+            } else if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref_mut() {
+                data.heartbeat_recv_time = Some(Instant::now());
+            }
+        }
         Command::Echo(data) => stream.write_all(&serialize_to_bulkstring(Some(data)))?,
         Command::Get(key) => {
             let value = state.get(key).map(|v| v.to_vec());
@@ -153,12 +185,12 @@ fn handle_command(
             if let ReplicaInfo::Master(_) = state.metadata.replica_info {
                 // Send OK as a response to REPLCONF listening-port or REPLCONF capa
                 stream.write_all(&serialize_to_simplestring(b"OK"))?
-            } else {
+            } else if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref() {
                 // Send REPLCONF ACK as a response to REPLCONF GETACK
                 stream.write_all(&serialize_to_array(&[
                     &serialize_to_bulkstring(Some(b"REPLCONF")),
                     &serialize_to_bulkstring(Some(b"ACK")),
-                    &serialize_to_bulkstring(Some(b"0")),
+                    &serialize_to_bulkstring(Some(data.offset.to_string().as_bytes())),
                 ]))?
             }
         }
@@ -234,6 +266,8 @@ fn try_handle_message(
                 handle_command(&command, stream, state.clone()).map_err(|_| ParseError::Invalid)?;
                 if let ReplicaInfo::Master(_) = state.metadata.replica_info {
                     handle_command_replication(&command, message, state.deref());
+                } else if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref_mut() {
+                    data.offset += result.len;
                 }
                 parsed += result.len;
             }
@@ -278,6 +312,10 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Resul
                             handle_command(&command, &mut stream, state.clone())?;
                             if let ReplicaInfo::Master(_) = state.metadata.replica_info {
                                 handle_command_replication(&command, message, state.deref());
+                            } else if let LiveData::Slave(data) =
+                                state.live_data.lock().unwrap().deref_mut()
+                            {
+                                data.offset += result.len;
                             }
                             parsed += result.len;
                         }
@@ -420,15 +458,14 @@ fn initiate_replication_as_slave(
                 parse_result.tokens.first().unwrap()
             ),
         }
-        let rdb_payload;
         // In case the entire RDB payload is not received in the first read
-        if resp.len() == parse_result.len {
+        let rdb_payload = if resp.len() == parse_result.len {
             // TODO: Fix below logic as read_single_message is not guaranteed to return entire RDB file
             println!("DEBUG: making additional call to read RDB payload");
-            rdb_payload = read_single_message(&mut stream)?;
+            read_single_message(&mut stream)?
         } else {
-            rdb_payload = resp[parse_result.len..].to_vec();
-        }
+            resp[parse_result.len..].to_vec()
+        };
         println!("DEBUG: received RDB payload (as hex): {:x?}", &rdb_payload);
         // TODO: Fix parse_rdb_payload panic if it has not received the entire RDB payload
         let rdb_parse_result = parse_rdb_payload(&rdb_payload);
@@ -438,11 +475,7 @@ fn initiate_replication_as_slave(
         );
         // TODO: handle errors gracefully
         let remaining = &rdb_payload[rdb_parse_result.len..];
-        if let Err(err) = try_handle_message(
-            remaining,
-            &mut stream,
-            state.clone(),
-        ) {
+        if let Err(err) = try_handle_message(remaining, &mut stream, state.clone()) {
             panic!("ERROR: failed to handle message with error {:?}", err);
         }
 

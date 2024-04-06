@@ -113,7 +113,7 @@ fn compile_and_get_command(tokens: &[Token]) -> Result<Command> {
     Ok(command)
 }
 
-pub fn parse_message(message: &[u8]) -> Result<CommandResult> {
+pub fn parse_command(message: &[u8]) -> Result<CommandResult> {
     let result = parse_buffer(message)?;
     let command = compile_and_get_command(result.tokens.as_slice())?;
     Ok(CommandResult {
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn test_parse_ping() {
         let message = b"*1\r\n$4\r\nping\r\n";
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::Ping);
         assert_eq!(result.len, message.len());
     }
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn test_parse_echo() {
         let message = b"*2\r\n$4\r\necho\r\n$4\r\ndata\r\n";
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::Echo(b"data".to_vec()));
         assert_eq!(result.len, message.len());
     }
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn test_parse_get() {
         let message = b"*2\r\n$3\r\nget\r\n$3\r\nkey\r\n";
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::Get(b"key".to_vec()));
         assert_eq!(result.len, message.len());
     }
@@ -154,7 +154,7 @@ mod tests {
     fn test_parse_set() {
         let message =
             b"*5\r\n$3\r\nset\r\n$5\r\nfruit\r\n$5\r\napple\r\n$2\r\npx\r\n$5\r\n65536\r\n";
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(
             result.command,
             Command::Set {
@@ -169,14 +169,14 @@ mod tests {
     #[test]
     fn test_parse_set_invalid_expiry() {
         let message = b"*4\r\n$3\r\nset\r\n$5\r\nfruit\r\n$5\r\napple\r\n$2\r\npx\r\n";
-        let result = parse_message(message);
+        let result = parse_command(message);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_info() {
         let message = b"*2\r\n$4\r\ninfo\r\n$4\r\nkeys\r\n";
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::Info(b"keys".to_vec()));
         assert_eq!(result.len, message.len());
     }
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn test_parse_replconf() {
         let message = b"*1\r\n$8\r\nreplconf\r\n";
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::ReplConf);
         assert_eq!(result.len, message.len());
     }
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn test_parse_psync() {
         let message = b"*1\r\n$5\r\npsync\r\n";
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::Psync);
         assert_eq!(result.len, message.len());
     }
@@ -213,22 +213,22 @@ mod tests {
         .concat();
 
         let message = message.as_slice();
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::Ping);
         assert_eq!(result.len, message_part_one.len());
 
         let message = &message[result.len..];
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::Echo(b"data".to_vec()));
         assert_eq!(result.len, message_part_two.len());
 
         let message = &message[result.len..];
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(result.command, Command::Get(b"key".to_vec()));
         assert_eq!(result.len, message_part_three.len());
 
         let message = &message[result.len..];
-        let result = parse_message(message).unwrap();
+        let result = parse_command(message).unwrap();
         assert_eq!(
             result.command,
             Command::Set {

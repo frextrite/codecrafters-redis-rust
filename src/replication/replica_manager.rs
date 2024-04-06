@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     io::Write,
     net::{SocketAddr, TcpStream},
-    sync::Mutex,
 };
 
 pub type ReplicaId = usize;

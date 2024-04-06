@@ -25,67 +25,86 @@ pub struct CommandResult {
     pub len: usize,
 }
 
+fn compile_ping_command(_: &[Token]) -> Result<Command> {
+    Ok(Command::Ping)
+}
+
+fn compile_echo_command(tokens: &[Token]) -> Result<Command> {
+    let data = match tokens.first() {
+        Some(Token::BulkString(data)) => data.clone(),
+        _ => Err(ParseError::Invalid)?,
+    };
+    Ok(Command::Echo(data))
+}
+
+fn compile_get_command(tokens: &[Token]) -> Result<Command> {
+    let key = match tokens.first() {
+        Some(Token::BulkString(key)) => key.clone(),
+        _ => Err(ParseError::Invalid)?,
+    };
+    Ok(Command::Get(key))
+}
+
+fn compile_set_command(tokens: &[Token]) -> Result<Command> {
+    let mut tokens = tokens.iter();
+    let key = match tokens.next() {
+        Some(Token::BulkString(key)) => key.clone(),
+        _ => Err(ParseError::Invalid)?,
+    };
+    let value = match tokens.next() {
+        Some(Token::BulkString(value)) => value.clone(),
+        _ => Err(ParseError::Invalid)?,
+    };
+    let expiry = match tokens.next() {
+        Some(Token::BulkString(expiry)) => {
+            let expiry = std::str::from_utf8(expiry).map_err(|_| ParseError::Invalid)?;
+            assert!(expiry.to_lowercase() == "px");
+            let millis = std::str::from_utf8(
+                tokens
+                    .next()
+                    .ok_or(ParseError::Invalid)?
+                    .get_bulk_string_data()?,
+            )
+            .map_err(|_| ParseError::Invalid)?
+            .parse()?;
+            Some(Duration::from_millis(millis))
+        }
+        Some(_) => Err(ParseError::Invalid)?,
+        None => None,
+    };
+    Ok(Command::Set { key, value, expiry })
+}
+
+fn compile_info_command(tokens: &[Token]) -> Result<Command> {
+    let section = match tokens.first() {
+        Some(Token::BulkString(section)) => section.clone(),
+        _ => Err(ParseError::Invalid)?,
+    };
+    Ok(Command::Info(section))
+}
+
+fn compile_replconf_command(_: &[Token]) -> Result<Command> {
+    Ok(Command::ReplConf)
+}
+
+fn compile_psync_command(_: &[Token]) -> Result<Command> {
+    Ok(Command::Psync)
+}
+
 fn compile_and_get_command(tokens: &[Token]) -> Result<Command> {
     let mut tokens = tokens.iter();
     let command = match tokens.next() {
         Some(Token::BulkString(command)) => {
-            let command = std::str::from_utf8(command).map_err(|_| ParseError::Invalid)?;
-            match command.to_lowercase().as_ref() {
-                "ping" => Command::Ping,
-                "echo" => Command::Echo(
-                    tokens
-                        .next()
-                        .ok_or(ParseError::Invalid)?
-                        .get_bulk_string_data()?
-                        .clone(),
-                ),
-                "get" => Command::Get(
-                    tokens
-                        .next()
-                        .ok_or(ParseError::Invalid)?
-                        .get_bulk_string_data()?
-                        .clone(),
-                ),
-                "set" => {
-                    let key = tokens
-                        .next()
-                        .ok_or(ParseError::Invalid)?
-                        .get_bulk_string_data()?
-                        .clone();
-                    let value = tokens
-                        .next()
-                        .ok_or(ParseError::Invalid)?
-                        .get_bulk_string_data()?
-                        .clone();
-                    let expiry: Option<Result<Duration>> = tokens.next().map(|token| {
-                        let arg = std::str::from_utf8(token.get_bulk_string_data()?)
-                            .map_err(|_| ParseError::Invalid)?;
-                        assert!(arg.to_lowercase() == "px");
-                        let millis = std::str::from_utf8(
-                            tokens
-                                .next()
-                                .ok_or(ParseError::Invalid)?
-                                .get_bulk_string_data()?,
-                        )
-                        .map_err(|_| ParseError::Invalid)?
-                        .parse()?;
-                        Ok(Duration::from_millis(millis))
-                    });
-                    let expiry = match expiry {
-                        Some(res) => Some(res?),
-                        None => None,
-                    };
-                    Command::Set { key, value, expiry }
-                }
-                "info" => Command::Info(
-                    tokens
-                        .next()
-                        .ok_or(ParseError::Invalid)?
-                        .get_bulk_string_data()?
-                        .clone(),
-                ),
-                "replconf" => Command::ReplConf,
-                "psync" => Command::Psync,
+            let rest = tokens.as_ref();
+            let name = std::str::from_utf8(command).map_err(|_| ParseError::Invalid)?;
+            match name.to_lowercase().as_ref() {
+                "ping" => compile_ping_command(rest)?,
+                "echo" => compile_echo_command(rest)?,
+                "get" => compile_get_command(rest)?,
+                "set" => compile_set_command(rest)?,
+                "info" => compile_info_command(rest)?,
+                "replconf" => compile_replconf_command(rest)?,
+                "psync" => compile_psync_command(rest)?,
                 _ => Err(ParseError::Invalid)?,
             }
         }

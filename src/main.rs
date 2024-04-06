@@ -7,7 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
+use redis_starter_rust::parser::command::{parse_command, Command};
+use redis_starter_rust::parser::resp;
+use redis_starter_rust::parser::resp::parse_buffer;
+use redis_starter_rust::parser::resp::ParseError;
+use redis_starter_rust::replication::rdb::{get_empty_rdb, parse_rdb_payload, serialize_rdb};
 use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
 use redis_starter_rust::state;
 
@@ -89,6 +93,7 @@ impl State {
     }
 }
 
+/*
 #[derive(Debug)]
 enum Command<'a> {
     Ping,
@@ -103,7 +108,7 @@ enum Command<'a> {
     Info(&'a [u8]),
     ReplConf,
     Psync,
-}
+}*/
 
 // TODO: avoid extra copies
 fn serialize_to_array(data: &[&[u8]]) -> Vec<u8> {
@@ -182,22 +187,9 @@ fn handle_command(
     Ok(())
 }
 
-fn bytes_to_unsigned(bytes: &[u8]) -> Option<u64> {
-    let mut integer = 0;
-    for digit in bytes {
-        if digit.is_ascii_digit() {
-            integer = integer * 10 + (digit - b'0') as u64;
-        } else {
-            return None;
-        }
-    }
-
-    Some(integer)
-}
-
 // This only works with "correct" clients since it does not check for the correctness of the
 // commands, and assumes that the client will send the correct number of arguments.
-fn parse_message(message: &[u8]) -> Option<Command> {
+/*fn parse_message(message: &[u8]) -> Option<Command> {
     match message.first() {
         Some(b'*') => {
             let message = std::str::from_utf8(message).unwrap();
@@ -238,7 +230,7 @@ fn parse_message(message: &[u8]) -> Option<Command> {
         ),
         None => None,
     }
-}
+}*/
 
 fn can_replicate_command(command: &Command) -> bool {
     matches!(command, Command::Set { .. })
@@ -273,16 +265,51 @@ fn handle_client_disconnect(stream: &TcpStream, state: &State) {
     }
 }
 
+// TODO: Refactor as the current version is copy pasted from handle_connection
+fn try_handle_message(
+    message: &[u8],
+    stream: &mut TcpStream,
+    state: Arc<State>,
+) -> resp::Result<()> {
+    let mut parsed = 0;
+    loop {
+        let next_message = &message[parsed..];
+        if next_message.is_empty() {
+            break;
+        }
+        match parse_command(next_message) {
+            Ok(result) => {
+                let command = result.command;
+                handle_command(&command, stream, state.clone()).map_err(|_| ParseError::Invalid)?;
+                if let ReplicaInfo::Master(_) = state.metadata.replica_info {
+                    handle_command_replication(&command, message, state.deref());
+                }
+                parsed += result.len;
+            }
+            Err(err) => {
+                eprintln!(
+                    "ERROR: failed to parse message {:?} with error {:?}",
+                    message, err
+                );
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
 // TcpStream::read() is *not* guaranteed to return the entire command, which means multiple
 // calls to read() are required to read an entire command.
 // TODO: handle the above scenario in which multiple calls to read() are required to obtain a
 // single command
 fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()> {
     let mut buf = [0; 1024];
-    loop {
-        match stream.read(&mut buf) {
+    let mut offset = 0;
+    'outer: loop {
+        let empty_buf = &mut buf[offset..];
+        match stream.read(empty_buf) {
             Ok(bytes_read) => {
-                let message = &buf[..bytes_read];
+                let message = &buf[..offset + bytes_read];
                 println!(
                     "INFO: read message {:?} with {} bytes from connection {:?}",
                     message,
@@ -292,15 +319,38 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Resul
                 if bytes_read == 0 {
                     break;
                 }
-                match parse_message(message) {
-                    Some(command) => {
-                        handle_command(&command, &mut stream, state.clone())?;
-                        if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-                            handle_command_replication(&command, message, state.deref());
-                        }
+                let mut parsed = 0;
+                loop {
+                    let next_message = &message[parsed..];
+                    if next_message.is_empty() {
+                        break;
                     }
-                    None => eprintln!("ERROR: failed to parse message {:?}", message),
+                    match parse_command(next_message) {
+                        Ok(result) => {
+                            let command = result.command;
+                            handle_command(&command, &mut stream, state.clone())?;
+                            if let ReplicaInfo::Master(_) = state.metadata.replica_info {
+                                handle_command_replication(&command, message, state.deref());
+                            }
+                            parsed += result.len;
+                        }
+                        Err(err) => match err {
+                            ParseError::Incomplete => {
+                                offset = message.len() - parsed;
+                                break;
+                            }
+                            ParseError::Invalid => {
+                                eprintln!(
+                                    "ERROR: failed to parse message {:?} with error {:?}",
+                                    message, err
+                                );
+                                break 'outer;
+                            }
+                        },
+                    }
                 }
+                let remaining = &message[parsed..].to_vec();
+                buf[..remaining.len()].copy_from_slice(remaining);
             }
             Err(error) => {
                 eprintln!(
@@ -360,10 +410,7 @@ fn send_req_and_receive_resp(
     stream.write_all(req)?;
 
     let resp = read_single_message(stream)?;
-    println!(
-        "DEBUG: received {:?} from master",
-        std::str::from_utf8(&resp).unwrap()
-    );
+    println!("DEBUG: received {:?} from master", resp);
 
     Ok(resp)
 }
@@ -409,7 +456,37 @@ fn initiate_replication_as_slave(
             &serialize_to_bulkstring(Some(b"?")),
             &serialize_to_bulkstring(Some(b"-1")),
         ]);
-        let _ = send_req_and_receive_resp(&psync_req, &mut stream, "PSYNC")?;
+        let resp = send_req_and_receive_resp(&psync_req, &mut stream, "PSYNC")?;
+        // TODO: Refactor this mess
+        let parse_result = parse_buffer(resp.as_ref()).unwrap();
+        match parse_result.tokens.first().unwrap() {
+            redis_starter_rust::parser::resp::Token::SimpleString(data) => {
+                let data = std::str::from_utf8(data.as_bytes()).unwrap();
+                if data.starts_with("FULLRESYNC") {
+                    println!("INFO: received FULLRESYNC from master: {:?}", data);
+                } else {
+                    panic!("Expected FULLRESYNC but received {:?}", data);
+                }
+            }
+            _ => panic!(
+                "Expected SimpleString but received {:?}",
+                parse_result.tokens.first().unwrap()
+            ),
+        }
+        let remaining = &resp[parse_result.len..];
+        let rdb_parse_result = parse_rdb_payload(remaining);
+        println!(
+            "DEBUG: remaining data after parsing PSYNC: {:?}",
+            std::str::from_utf8(&remaining[rdb_parse_result.len..]).unwrap()
+        );
+        // TODO: handle errors gracefully
+        if let Err(err) = try_handle_message(
+            &remaining[rdb_parse_result.len..],
+            &mut stream,
+            state.clone(),
+        ) {
+            panic!("ERROR: failed to handle message with error {:?}", err);
+        }
 
         println!("INFO: successfully initiated replication for slave");
 

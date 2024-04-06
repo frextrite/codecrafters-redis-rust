@@ -21,7 +21,6 @@ impl Token {
         }
     }
 
-    #[allow(dead_code)]
     pub fn get_simple_string_data(&self) -> Result<&String> {
         if let Token::SimpleString(data) = self {
             Ok(data)
@@ -58,7 +57,7 @@ impl From<ParseIntError> for ParseError {
     }
 }
 
-fn find_first_crlf(message: &[u8]) -> Option<usize> {
+pub fn find_first_crlf(message: &[u8]) -> Option<usize> {
     (0..message.len() - 1).find(|&i| message[i] == CR && message[i + 1] == LF)
 }
 

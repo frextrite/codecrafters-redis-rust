@@ -148,7 +148,20 @@ fn handle_command(
             )))?,
             _ => panic!("Not expecting to receive section other than replication"),
         },
-        Command::ReplConf => stream.write_all(&serialize_to_simplestring(b"OK"))?,
+        Command::ReplConf => {
+            // TODO: Handle REPLCONF command validation before sending responses
+            if let ReplicaInfo::Master(_) = state.metadata.replica_info {
+                // Send OK as a response to REPLCONF listening-port or REPLCONF capa
+                stream.write_all(&serialize_to_simplestring(b"OK"))?
+            } else {
+                // Send REPLCONF ACK as a response to REPLCONF GETACK
+                stream.write_all(&serialize_to_array(&[
+                    &serialize_to_bulkstring(Some(b"REPLCONF")),
+                    &serialize_to_bulkstring(Some(b"ACK")),
+                    &serialize_to_bulkstring(Some(b"0")),
+                ]))?
+            }
+        }
         Command::Psync => {
             if let ReplicaInfo::Master(info) = &state.metadata.replica_info {
                 let payload = format!(
@@ -246,7 +259,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Resul
                 let message = &buf[..offset + bytes_read];
                 println!(
                     "INFO: read message {:?} with {} bytes from connection {:?}",
-                    message,
+                    std::str::from_utf8(message).unwrap(),
                     bytes_read,
                     stream.peer_addr()
                 );
@@ -407,15 +420,26 @@ fn initiate_replication_as_slave(
                 parse_result.tokens.first().unwrap()
             ),
         }
-        let remaining = &resp[parse_result.len..];
-        let rdb_parse_result = parse_rdb_payload(remaining);
+        let rdb_payload;
+        // In case the entire RDB payload is not received in the first read
+        if resp.len() == parse_result.len {
+            // TODO: Fix below logic as read_single_message is not guaranteed to return entire RDB file
+            println!("DEBUG: making additional call to read RDB payload");
+            rdb_payload = read_single_message(&mut stream)?;
+        } else {
+            rdb_payload = resp[parse_result.len..].to_vec();
+        }
+        println!("DEBUG: received RDB payload (as hex): {:x?}", &rdb_payload);
+        // TODO: Fix parse_rdb_payload panic if it has not received the entire RDB payload
+        let rdb_parse_result = parse_rdb_payload(&rdb_payload);
         println!(
             "DEBUG: remaining data after parsing PSYNC: {:?}",
-            std::str::from_utf8(&remaining[rdb_parse_result.len..]).unwrap()
+            std::str::from_utf8(&rdb_payload[rdb_parse_result.len..]).unwrap()
         );
         // TODO: handle errors gracefully
+        let remaining = &rdb_payload[rdb_parse_result.len..];
         if let Err(err) = try_handle_message(
-            &remaining[rdb_parse_result.len..],
+            remaining,
             &mut stream,
             state.clone(),
         ) {

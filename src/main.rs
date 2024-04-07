@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use redis_starter_rust::network::connection;
 use redis_starter_rust::parser::command::{parse_command, Command};
+use redis_starter_rust::parser::rdb::parse_rdb_payload;
 use redis_starter_rust::parser::resp;
 use redis_starter_rust::parser::resp::parse_buffer;
 use redis_starter_rust::parser::resp::ParseError;
-use redis_starter_rust::replication::rdb::{get_empty_rdb, parse_rdb_payload, serialize_rdb};
+use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
 use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
 use redis_starter_rust::state;
 
@@ -400,6 +402,49 @@ fn send_req_and_receive_resp(
     Ok(resp)
 }
 
+// Validates FULLRESYNC response that is received, as well as the
+// RDB payload response. This does not propagate the payload to the caller
+// and panics in case the message is not as expected.
+// Modify this to propagate information to the caller.
+fn parse_and_validate_psync_response(conn: &mut connection::Connection) {
+    match conn.try_parse(parse_buffer) {
+        Ok(result) => {
+            if result.tokens.len() != 1 {
+                panic!(
+                    "Expected 1 token in PSYNC response but received {}",
+                    result.tokens.len()
+                );
+            }
+            match result.tokens.first().unwrap() {
+                resp::Token::SimpleString(data) => {
+                    let data = std::str::from_utf8(data.as_bytes()).unwrap();
+                    if data.starts_with("FULLRESYNC") {
+                        println!("INFO: received FULLRESYNC from master: {:?}", data);
+                    } else {
+                        panic!("Expected FULLRESYNC but received {:?}", data);
+                    }
+                }
+                _ => panic!(
+                    "Expected SimpleString but received {:?}",
+                    result.tokens.first().unwrap()
+                ),
+            }
+            conn.consume(result.len);
+        }
+        Err(err) => panic!("Failed to parse PSYNC response with error {:?}", err),
+    };
+    match conn.try_parse(parse_rdb_payload) {
+        Ok(result) => {
+            println!(
+                "DEBUG: successfully parsed RDB payload with length {}",
+                result.len
+            );
+            conn.consume(result.len);
+        }
+        Err(err) => panic!("Failed to parse RDB payload with error {:?}", err),
+    };
+}
+
 fn initiate_replication_as_slave(
     host: String,
     port: u16,
@@ -442,39 +487,10 @@ fn initiate_replication_as_slave(
             &serialize_to_bulkstring(Some(b"-1")),
         ]);
         let resp = send_req_and_receive_resp(&psync_req, &mut stream, "PSYNC")?;
-        // TODO: Refactor this mess
-        let parse_result = parse_buffer(resp.as_ref()).unwrap();
-        match parse_result.tokens.first().unwrap() {
-            redis_starter_rust::parser::resp::Token::SimpleString(data) => {
-                let data = std::str::from_utf8(data.as_bytes()).unwrap();
-                if data.starts_with("FULLRESYNC") {
-                    println!("INFO: received FULLRESYNC from master: {:?}", data);
-                } else {
-                    panic!("Expected FULLRESYNC but received {:?}", data);
-                }
-            }
-            _ => panic!(
-                "Expected SimpleString but received {:?}",
-                parse_result.tokens.first().unwrap()
-            ),
-        }
-        // In case the entire RDB payload is not received in the first read
-        let rdb_payload = if resp.len() == parse_result.len {
-            // TODO: Fix below logic as read_single_message is not guaranteed to return entire RDB file
-            println!("DEBUG: making additional call to read RDB payload");
-            read_single_message(&mut stream)?
-        } else {
-            resp[parse_result.len..].to_vec()
-        };
-        println!("DEBUG: received RDB payload (as hex): {:x?}", &rdb_payload);
-        // TODO: Fix parse_rdb_payload panic if it has not received the entire RDB payload
-        let rdb_parse_result = parse_rdb_payload(&rdb_payload);
-        println!(
-            "DEBUG: remaining data after parsing PSYNC: {:?}",
-            std::str::from_utf8(&rdb_payload[rdb_parse_result.len..]).unwrap()
-        );
-        // TODO: handle errors gracefully
-        let remaining = &rdb_payload[rdb_parse_result.len..];
+        let mut conn = connection::Connection::from_existing(stream.try_clone()?, &resp);
+        parse_and_validate_psync_response(&mut conn);
+        // TODO: Refactor this to use Connection directly
+        let remaining = conn.get_buffer();
         if let Err(err) = try_handle_message(remaining, &mut stream, state.clone()) {
             panic!("ERROR: failed to handle message with error {:?}", err);
         }

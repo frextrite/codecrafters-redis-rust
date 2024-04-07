@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
@@ -11,7 +10,7 @@ use redis_starter_rust::network::connection::{Connection, ConnectionError, Conne
 use redis_starter_rust::parser::command::{parse_command, Command};
 use redis_starter_rust::parser::rdb::parse_rdb_payload;
 use redis_starter_rust::parser::resp::parse_buffer;
-use redis_starter_rust::parser::resp::{ParseResult, Token};
+use redis_starter_rust::parser::resp::Token;
 use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
 use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
 use redis_starter_rust::state;
@@ -296,31 +295,6 @@ fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result
     Ok(())
 }
 
-fn validate_received_resp(resp: &ParseResult, expected_data: &str) {
-    if resp.tokens.len() != 1 {
-        panic!(
-            "Expected 1 token in response but received {}",
-            resp.tokens.len()
-        );
-    }
-    match resp.tokens.first() {
-        Some(Token::SimpleString(data)) => {
-            if let Ordering::Equal = data.to_lowercase().cmp(&expected_data.to_lowercase()) {
-            } else {
-                panic!(
-                    "Received {:?} from master but {:?} was expected",
-                    std::str::from_utf8(data.as_bytes()).unwrap(),
-                    expected_data,
-                );
-            }
-        }
-        _ => panic!(
-            "Expected SimpleString but received {:?}",
-            resp.tokens.first()
-        ),
-    }
-}
-
 fn send_req(req: &[u8], conn: &mut Connection, command: &str) -> std::io::Result<()> {
     println!(
         "INFO: sending {} request {:?}",
@@ -378,11 +352,19 @@ fn send_req_and_validate_simple_string_resp(
     req: &[u8],
     conn: &mut Connection,
     command: &str,
-    expected_data: &str,
+    expected: &str,
 ) -> ConnectionResult<()> {
     send_req(req, conn, command)?;
     let resp = conn.try_parse(parse_buffer)?;
-    validate_received_resp(&resp, expected_data);
+    if resp.tokens.len() != 1
+        || resp.tokens.first().unwrap() != &Token::SimpleString(expected.to_string())
+    {
+        panic!(
+            "Expected SimpleString {:?} but received {:?}",
+            expected,
+            resp.tokens.first()
+        );
+    }
     conn.consume(resp.len);
     Ok(())
 }

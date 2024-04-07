@@ -1,5 +1,7 @@
 use crate::parser::resp::ParseError;
 use crate::parser::resp::Result;
+use std::io;
+use std::io::Write;
 use std::{io::Read, net::TcpStream};
 
 pub type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
@@ -23,10 +25,10 @@ pub struct Connection {
 }
 
 impl Connection {
-    fn read_from_stream(&mut self) -> ConnectionResult<()> {
+    fn read_from_stream(&mut self) -> io::Result<usize> {
         let read = self.stream.read(&mut self.buffer[self.offset..])?;
         self.offset += read;
-        Ok(())
+        Ok(read)
     }
 }
 
@@ -44,6 +46,11 @@ impl Connection {
         conn.buffer[..buffer.len()].copy_from_slice(buffer);
         conn.offset = buffer.len();
         conn
+    }
+
+    pub fn write_to_stream(&mut self, data: &[u8]) -> io::Result<()> {
+        self.stream.write_all(data)?;
+        Ok(())
     }
 
     pub fn get_buffer(&self) -> &[u8] {

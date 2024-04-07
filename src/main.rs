@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
 use std::str;
@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use redis_starter_rust::network::connection::{self, Connection, ConnectionError};
+use redis_starter_rust::network::connection::{Connection, ConnectionError, ConnectionResult};
 use redis_starter_rust::parser::command::{parse_command, Command};
 use redis_starter_rust::parser::rdb::parse_rdb_payload;
-use redis_starter_rust::parser::resp;
 use redis_starter_rust::parser::resp::parse_buffer;
+use redis_starter_rust::parser::resp::{ParseResult, Token};
 use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
 use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
 use redis_starter_rust::state;
@@ -296,50 +296,46 @@ fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result
     Ok(())
 }
 
-fn cmp_simple_strings(received: &[u8], expected_data: &[u8]) -> Ordering {
-    received.cmp(&serialize_to_simplestring(expected_data))
-}
-
-fn read_single_message(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let mut buf = [0; 512];
-    let n = stream.read(&mut buf)?;
-    Ok(buf[..n].to_vec())
-}
-
-fn validate_received_resp(resp: &[u8], expected_data: &str) {
-    if let Ordering::Equal = cmp_simple_strings(resp, expected_data.as_bytes()) {
-    } else {
+fn validate_received_resp(resp: &ParseResult, expected_data: &str) {
+    if resp.tokens.len() != 1 {
         panic!(
-            "Received {:?} from master but {:?} was expected",
-            std::str::from_utf8(resp).unwrap(),
-            expected_data,
+            "Expected 1 token in response but received {}",
+            resp.tokens.len()
         );
+    }
+    match resp.tokens.first() {
+        Some(Token::SimpleString(data)) => {
+            if let Ordering::Equal = data.to_lowercase().cmp(&expected_data.to_lowercase()) {
+            } else {
+                panic!(
+                    "Received {:?} from master but {:?} was expected",
+                    std::str::from_utf8(data.as_bytes()).unwrap(),
+                    expected_data,
+                );
+            }
+        }
+        _ => panic!(
+            "Expected SimpleString but received {:?}",
+            resp.tokens.first()
+        ),
     }
 }
 
-fn send_req_and_receive_resp(
-    req: &[u8],
-    stream: &mut TcpStream,
-    command: &str,
-) -> std::io::Result<Vec<u8>> {
+fn send_req(req: &[u8], conn: &mut Connection, command: &str) -> std::io::Result<()> {
     println!(
         "INFO: sending {} request {:?}",
         command,
         std::str::from_utf8(req).unwrap()
     );
-    stream.write_all(req)?;
-
-    let resp = read_single_message(stream)?;
-    println!("DEBUG: received {:?} from master", resp);
-
-    Ok(resp)
+    conn.write_to_stream(req)?;
+    Ok(())
 }
 
 // Validates FULLRESYNC response that is received, as well as the
 // RDB payload response. This does not propagate the payload to the caller
 // and panics in case the message is not as expected.
 // Modify this to propagate information to the caller.
-fn parse_and_validate_psync_response(conn: &mut connection::Connection) {
+fn parse_and_validate_psync_response(conn: &mut Connection) {
     match conn.try_parse(parse_buffer) {
         Ok(result) => {
             if result.tokens.len() != 1 {
@@ -349,7 +345,7 @@ fn parse_and_validate_psync_response(conn: &mut connection::Connection) {
                 );
             }
             match result.tokens.first().unwrap() {
-                resp::Token::SimpleString(data) => {
+                Token::SimpleString(data) => {
                     let data = std::str::from_utf8(data.as_bytes()).unwrap();
                     if data.starts_with("FULLRESYNC") {
                         println!("INFO: received FULLRESYNC from master: {:?}", data);
@@ -378,21 +374,35 @@ fn parse_and_validate_psync_response(conn: &mut connection::Connection) {
     };
 }
 
+fn send_req_and_validate_simple_string_resp(
+    req: &[u8],
+    conn: &mut Connection,
+    command: &str,
+    expected_data: &str,
+) -> ConnectionResult<()> {
+    send_req(req, conn, command)?;
+    let resp = conn.try_parse(parse_buffer)?;
+    validate_received_resp(&resp, expected_data);
+    conn.consume(resp.len);
+    Ok(())
+}
+
 fn initiate_replication_as_slave(
     host: String,
     port: u16,
     host_port: u16,
     state: Arc<State>,
-) -> std::io::Result<()> {
+) -> ConnectionResult<()> {
     println!("INFO: connecting to master at {}:{}", &host, port);
     {
-        let mut stream = TcpStream::connect((host, port))?;
+        let stream = TcpStream::connect((host, port))?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut conn = Connection::new(stream.try_clone()?);
+
         // Step 1: Send PING
         // TODO: Use Vec instead of a slice since the array size cannot be known at compile time for generic arrays
         let ping_req = serialize_to_array(&[&serialize_to_bulkstring(Some(b"PING"))]);
-        let resp = send_req_and_receive_resp(&ping_req, &mut stream, "PING")?;
-        validate_received_resp(&resp, "PONG");
+        send_req_and_validate_simple_string_resp(&ping_req, &mut conn, "PING", "PONG")?;
 
         // Step 2: Send REPLCONF messages
         // Step 2.1: Send REPLCONF with listening-port information
@@ -401,8 +411,7 @@ fn initiate_replication_as_slave(
             &serialize_to_bulkstring(Some(b"listening-port")),
             &serialize_to_bulkstring(Some(host_port.to_string().as_bytes())),
         ]);
-        let resp = send_req_and_receive_resp(&repl_conf_port_req, &mut stream, "REPLCONF")?;
-        validate_received_resp(&resp, "OK");
+        send_req_and_validate_simple_string_resp(&repl_conf_port_req, &mut conn, "REPLCONF", "OK")?;
 
         // Step 2.2: Send REPLCONF with capabilities information
         let repl_conf_capa_req = serialize_to_array(&[
@@ -410,8 +419,7 @@ fn initiate_replication_as_slave(
             &serialize_to_bulkstring(Some(b"capa")),
             &serialize_to_bulkstring(Some(b"psync2")),
         ]);
-        let resp = send_req_and_receive_resp(&repl_conf_capa_req, &mut stream, "REPLCONF")?;
-        validate_received_resp(&resp, "OK");
+        send_req_and_validate_simple_string_resp(&repl_conf_capa_req, &mut conn, "REPLCONF", "OK")?;
 
         // Step 3: Send PSYNC message
         let psync_req = serialize_to_array(&[
@@ -419,8 +427,7 @@ fn initiate_replication_as_slave(
             &serialize_to_bulkstring(Some(b"?")),
             &serialize_to_bulkstring(Some(b"-1")),
         ]);
-        let resp = send_req_and_receive_resp(&psync_req, &mut stream, "PSYNC")?;
-        let mut conn = connection::Connection::from_existing(stream.try_clone()?, &resp);
+        send_req(&psync_req, &mut conn, "PSYNC")?;
         parse_and_validate_psync_response(&mut conn);
 
         println!("INFO: successfully initiated replication for slave");
@@ -483,7 +490,7 @@ fn main() {
                     "INFO: accepted incoming connection from {:?}",
                     stream.peer_addr()
                 );
-                let conn = connection::Connection::new(stream);
+                let conn = Connection::new(stream);
                 let state = state.clone();
                 std::thread::spawn(|| handle_connection(conn, state).unwrap());
             }

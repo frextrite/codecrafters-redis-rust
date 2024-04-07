@@ -7,12 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use redis_starter_rust::network::connection;
+use redis_starter_rust::network::connection::{self, Connection, ConnectionError};
 use redis_starter_rust::parser::command::{parse_command, Command};
 use redis_starter_rust::parser::rdb::parse_rdb_payload;
 use redis_starter_rust::parser::resp;
 use redis_starter_rust::parser::resp::parse_buffer;
-use redis_starter_rust::parser::resp::ParseError;
 use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
 use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
 use redis_starter_rust::state;
@@ -250,106 +249,40 @@ fn handle_client_disconnect(stream: &TcpStream, state: &State) {
     }
 }
 
-// TODO: Refactor as the current version is copy pasted from handle_connection
-fn try_handle_message(
-    message: &[u8],
-    stream: &mut TcpStream,
-    state: Arc<State>,
-) -> resp::Result<()> {
-    let mut parsed = 0;
+fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result<()> {
     loop {
-        let next_message = &message[parsed..];
-        if next_message.is_empty() {
-            break;
-        }
-        match parse_command(next_message) {
+        match conn.try_parse(parse_command) {
             Ok(result) => {
                 let command = result.command;
-                handle_command(&command, stream, state.clone()).map_err(|_| ParseError::Invalid)?;
+                handle_command(&command, &mut conn.stream, state.clone())?;
                 if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-                    handle_command_replication(&command, message, state.deref());
+                    handle_command_replication(&command, conn.get_buffer(), state.deref());
                 } else if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref_mut() {
                     data.offset += result.len;
                 }
-                parsed += result.len;
+                conn.consume(result.len);
             }
-            Err(err) => {
-                eprintln!(
-                    "ERROR: failed to parse message {:?} with error {:?}",
-                    message, err
-                );
-                return Err(err);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Result<()> {
-    let mut buf = [0; 1024];
-    let mut offset = 0;
-    'outer: loop {
-        let empty_buf = &mut buf[offset..];
-        match stream.read(empty_buf) {
-            Ok(bytes_read) => {
-                let message = &buf[..offset + bytes_read];
-                println!(
-                    "INFO: read message {:?} with {} bytes from connection {:?}",
-                    std::str::from_utf8(message).unwrap(),
-                    bytes_read,
-                    stream.peer_addr()
-                );
-                if bytes_read == 0 {
+            Err(err) => match err {
+                ConnectionError::Io(io_err) => {
+                    eprintln!(
+                        "ERROR: failed to read from connection {:?} with error {:?}",
+                        conn.stream.peer_addr(),
+                        io_err
+                    );
+                    match io_err.kind() {
+                        std::io::ErrorKind::Interrupted => continue,
+                        _ => break,
+                    }
+                }
+                ConnectionError::Parse(parse_err) => {
+                    eprintln!(
+                        "ERROR: failed to parse message {:?} with error {:?}",
+                        conn.get_buffer(),
+                        parse_err
+                    );
                     break;
                 }
-                let mut parsed = 0;
-                loop {
-                    let next_message = &message[parsed..];
-                    if next_message.is_empty() {
-                        break;
-                    }
-                    match parse_command(next_message) {
-                        Ok(result) => {
-                            let command = result.command;
-                            handle_command(&command, &mut stream, state.clone())?;
-                            if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-                                handle_command_replication(&command, message, state.deref());
-                            } else if let LiveData::Slave(data) =
-                                state.live_data.lock().unwrap().deref_mut()
-                            {
-                                data.offset += result.len;
-                            }
-                            parsed += result.len;
-                        }
-                        Err(err) => match err {
-                            ParseError::Incomplete => {
-                                offset = message.len() - parsed;
-                                break;
-                            }
-                            ParseError::Invalid => {
-                                eprintln!(
-                                    "ERROR: failed to parse message {:?} with error {:?}",
-                                    message, err
-                                );
-                                break 'outer;
-                            }
-                        },
-                    }
-                }
-                let remaining = &message[parsed..].to_vec();
-                buf[..remaining.len()].copy_from_slice(remaining);
-            }
-            Err(error) => {
-                eprintln!(
-                    "ERROR: failed to read from connection {:?} with error {:?}",
-                    stream.peer_addr(),
-                    error
-                );
-                match error.kind() {
-                    std::io::ErrorKind::Interrupted => continue,
-                    _ => break,
-                }
-            }
+            },
         }
     }
     // TOOD: Instead of calling remove_replica unconditionally, propagate replica status for the client here
@@ -358,7 +291,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<State>) -> std::io::Resul
     // We cannot know whether there is atleast one replica listening for commands since this
     // information is only known by replication sub-system, hence propagate all commands
     if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-        handle_client_disconnect(&stream, state.deref());
+        handle_client_disconnect(&conn.stream, state.deref());
     }
     Ok(())
 }
@@ -489,16 +422,11 @@ fn initiate_replication_as_slave(
         let resp = send_req_and_receive_resp(&psync_req, &mut stream, "PSYNC")?;
         let mut conn = connection::Connection::from_existing(stream.try_clone()?, &resp);
         parse_and_validate_psync_response(&mut conn);
-        // TODO: Refactor this to use Connection directly
-        let remaining = conn.get_buffer();
-        if let Err(err) = try_handle_message(remaining, &mut stream, state.clone()) {
-            panic!("ERROR: failed to handle message with error {:?}", err);
-        }
 
         println!("INFO: successfully initiated replication for slave");
 
         // Start replication
-        handle_connection(stream, state)?;
+        handle_connection(conn, state)?;
     }
     Ok(())
 }
@@ -555,8 +483,9 @@ fn main() {
                     "INFO: accepted incoming connection from {:?}",
                     stream.peer_addr()
                 );
+                let conn = connection::Connection::new(stream);
                 let state = state.clone();
-                std::thread::spawn(|| handle_connection(stream, state).unwrap());
+                std::thread::spawn(|| handle_connection(conn, state).unwrap());
             }
             Err(error) => {
                 eprintln!(

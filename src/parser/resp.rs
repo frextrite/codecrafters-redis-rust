@@ -142,10 +142,6 @@ fn parse_array(message: &[u8]) -> Result<ParseResult> {
 }
 
 pub fn parse_buffer(buffer: &[u8]) -> Result<ParseResult> {
-    if buffer.is_empty() {
-        panic!("parse_buffer called with empty buffer");
-    }
-
     match buffer.first() {
         Some(b'*') => parse_array(buffer),
         Some(b'+') => parse_simple_string(buffer),
@@ -154,7 +150,7 @@ pub fn parse_buffer(buffer: &[u8]) -> Result<ParseResult> {
             "parser does not support parsing messages starting with {:?}",
             byte
         ),
-        None => todo!(),
+        None => Err(ParseError::Incomplete),
     }
 }
 

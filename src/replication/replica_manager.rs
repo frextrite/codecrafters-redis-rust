@@ -37,6 +37,10 @@ impl ReplicaManager {
         self.replicas.remove(&addr)
     }
 
+    pub fn get_connected_replica_count(&self) -> usize {
+        self.replicas.len()
+    }
+
     pub fn propagate_message_to_replicas(&mut self, message: &[u8]) {
         for (_, replica) in self.replicas.iter_mut() {
             let _ = replica.stream.write_all(message);

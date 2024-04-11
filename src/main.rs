@@ -217,7 +217,18 @@ fn handle_command(
         }
         Command::Wait { .. } => {
             if let ReplicaInfo::Master(..) = state.metadata.replica_info {
-                stream.write_all(&serialize_to_integer(0))?;
+                let response = serialize_to_integer(
+                    state
+                        .replica_manager
+                        .lock()
+                        .unwrap()
+                        .get_connected_replica_count(),
+                );
+                println!(
+                    "DEBUG: sending WAIT response {:?}",
+                    std::str::from_utf8(&response).unwrap()
+                );
+                stream.write_all(&response)?;
             }
         }
     };

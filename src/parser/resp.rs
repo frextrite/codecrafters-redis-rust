@@ -57,6 +57,12 @@ impl From<ParseIntError> for ParseError {
     }
 }
 
+impl From<std::str::Utf8Error> for ParseError {
+    fn from(_value: std::str::Utf8Error) -> Self {
+        ParseError::Invalid
+    }
+}
+
 pub fn find_first_crlf(message: &[u8]) -> Option<usize> {
     if message.len() < 2 {
         return None;

@@ -57,15 +57,14 @@ fn compile_set_command(tokens: &[Token]) -> Result<Command> {
     };
     let expiry = match tokens.next() {
         Some(Token::BulkString(expiry)) => {
-            let expiry = std::str::from_utf8(expiry).map_err(|_| ParseError::Invalid)?;
+            let expiry = std::str::from_utf8(expiry)?;
             assert!(expiry.to_lowercase() == "px");
             let millis = std::str::from_utf8(
                 tokens
                     .next()
                     .ok_or(ParseError::Invalid)?
                     .get_bulk_string_data()?,
-            )
-            .map_err(|_| ParseError::Invalid)?
+            )?
             .parse()?;
             Some(Duration::from_millis(millis))
         }
@@ -96,7 +95,7 @@ fn compile_and_get_command(tokens: &[Token]) -> Result<Command> {
     let command = match tokens.next() {
         Some(Token::BulkString(command)) => {
             let rest = tokens.as_ref();
-            let name = std::str::from_utf8(command).map_err(|_| ParseError::Invalid)?;
+            let name = std::str::from_utf8(command)?;
             match name.to_lowercase().as_ref() {
                 "ping" => compile_ping_command(rest)?,
                 "echo" => compile_echo_command(rest)?,

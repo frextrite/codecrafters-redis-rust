@@ -142,6 +142,10 @@ fn serialize_to_simplestring(data: &[u8]) -> Vec<u8> {
     format!("+{}{CRLF}", std::str::from_utf8(data).unwrap()).into_bytes()
 }
 
+fn serialize_to_integer(value: usize) -> Vec<u8> {
+    format!(":{}{CRLF}", value).into_bytes()
+}
+
 fn handle_command(
     command: &Command,
     stream: &mut TcpStream,
@@ -209,6 +213,11 @@ fn handle_command(
                 state.replica_manager.lock().unwrap().add_replica(replica);
             } else {
                 panic!("PSYNC not supported on slave")
+            }
+        }
+        Command::Wait { .. } => {
+            if let ReplicaInfo::Master(..) = state.metadata.replica_info {
+                stream.write_all(&serialize_to_integer(0))?;
             }
         }
     };

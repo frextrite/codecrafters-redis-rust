@@ -18,6 +18,10 @@ pub enum Command {
     Info(Vec<u8>),
     ReplConf,
     Psync,
+    Wait {
+        replica_count: usize,
+        timeout: Duration,
+    },
 }
 
 pub struct CommandResult {
@@ -90,6 +94,24 @@ fn compile_psync_command(_: &[Token]) -> Result<Command> {
     Ok(Command::Psync)
 }
 
+fn compile_wait_command(tokens: &[Token]) -> Result<Command> {
+    let mut tokens = tokens.iter();
+    let replica_count = match tokens.next() {
+        Some(Token::BulkString(count)) => std::str::from_utf8(count)?.parse()?,
+        _ => Err(ParseError::Invalid)?,
+    };
+    let timeout = match tokens.next() {
+        Some(Token::BulkString(timeout)) => {
+            Duration::from_millis(std::str::from_utf8(timeout)?.parse()?)
+        }
+        _ => Err(ParseError::Invalid)?,
+    };
+    Ok(Command::Wait {
+        replica_count,
+        timeout,
+    })
+}
+
 fn compile_and_get_command(tokens: &[Token]) -> Result<Command> {
     let mut tokens = tokens.iter();
     let command = match tokens.next() {
@@ -104,6 +126,7 @@ fn compile_and_get_command(tokens: &[Token]) -> Result<Command> {
                 "info" => compile_info_command(rest)?,
                 "replconf" => compile_replconf_command(rest)?,
                 "psync" => compile_psync_command(rest)?,
+                "wait" => compile_wait_command(rest)?,
                 _ => Err(ParseError::Invalid)?,
             }
         }

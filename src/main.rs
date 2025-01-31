@@ -27,8 +27,8 @@ const CRLF: &str = "\r\n";
 struct Cli {
     #[arg(short, long, default_value_t = 6379)]
     port: u16,
-    #[arg(short, long, num_args = 2)]
-    replicaof: Option<Vec<String>>,
+    #[arg(short, long)]
+    replicaof: Option<String>,
 }
 
 #[derive(Debug)]
@@ -217,6 +217,19 @@ fn handle_command(
         }
         Command::Wait { .. } => {
             if let ReplicaInfo::Master(..) = state.metadata.replica_info {
+                // Send REPLCONF GETACK to all replicas
+                state
+                    .replica_manager
+                    .lock()
+                    .unwrap()
+                    .propagate_message_to_replicas(&serialize_to_array(&[
+                        &serialize_to_bulkstring(Some(b"REPLCONF")),
+                        &serialize_to_bulkstring(Some(b"GETACK")),
+                        &serialize_to_bulkstring(Some(b"*")),
+                    ]));
+
+                // TODO: Read response from all replicas
+
                 let response = serialize_to_integer(
                     state
                         .replica_manager
@@ -481,7 +494,10 @@ fn main() {
 
     println!("INFO: started listener on {:?}", addr);
 
-    let metadata = generate_server_metadata(args.replicaof);
+    let metadata = generate_server_metadata(
+        args.replicaof
+            .map(|info| info.split_whitespace().map(str::to_string).collect()),
+    );
     let state = Arc::new(State::new(metadata));
     initiate_replication(state.clone(), args.port);
 

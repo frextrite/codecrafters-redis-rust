@@ -4,15 +4,21 @@ use std::{
     net::{SocketAddr, TcpStream},
 };
 
+use crate::network::connection::Connection;
+
 pub type ReplicaId = usize;
 
 pub struct Replica {
-    stream: TcpStream,
+    pub conn: Connection,
+    replica_offset: usize,
 }
 
 impl Replica {
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream }
+        Self {
+            conn: Connection::new(stream),
+            replica_offset: 0,
+        }
     }
 }
 
@@ -30,7 +36,7 @@ impl ReplicaManager {
 
     pub fn add_replica(&mut self, replica: Replica) -> Option<Replica> {
         self.replicas
-            .insert(replica.stream.peer_addr().unwrap(), replica)
+            .insert(replica.conn.stream.peer_addr().unwrap(), replica)
     }
 
     pub fn remove_replica(&mut self, addr: SocketAddr) -> Option<Replica> {
@@ -43,7 +49,21 @@ impl ReplicaManager {
 
     pub fn propagate_message_to_replicas(&mut self, message: &[u8]) {
         for (_, replica) in self.replicas.iter_mut() {
-            let _ = replica.stream.write_all(message);
+            let _ = replica.conn.stream.write_all(message);
         }
+    }
+
+    pub fn update_replica_offset(&mut self, stream: &TcpStream, offset: usize) {
+        let replica = self.replicas.get_mut(&stream.peer_addr().unwrap());
+        if let Some(replica) = replica {
+            replica.replica_offset = offset;
+        }
+    }
+
+    pub fn get_up_to_date_replicas_count(&self, offset: usize) -> usize {
+        self.replicas
+            .values()
+            .filter(|replica| replica.replica_offset >= offset)
+            .count()
     }
 }

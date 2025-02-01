@@ -16,7 +16,7 @@ pub enum Command {
         expiry: Option<Duration>,
     },
     Info(Vec<u8>),
-    ReplConf,
+    ReplConf(String, usize),
     Psync,
     Wait {
         replica_count: usize,
@@ -86,8 +86,22 @@ fn compile_info_command(tokens: &[Token]) -> Result<Command> {
     Ok(Command::Info(section))
 }
 
-fn compile_replconf_command(_: &[Token]) -> Result<Command> {
-    Ok(Command::ReplConf)
+fn compile_replconf_command(tokens: &[Token]) -> Result<Command> {
+    let replconf_type = match tokens.first() {
+        Some(Token::BulkString(replconf_type)) => std::str::from_utf8(replconf_type)?.to_string(),
+        _ => Err(ParseError::Invalid)?,
+    };
+    let offset = match tokens.len() {
+        2 => match &replconf_type.eq_ignore_ascii_case("ack") {
+            true => match &tokens[1] {
+                Token::BulkString(offset) => std::str::from_utf8(offset)?.parse()?,
+                _ => Err(ParseError::Invalid)?,
+            },
+            _ => 0,
+        },
+        _ => 0,
+    };
+    Ok(Command::ReplConf(replconf_type, offset))
 }
 
 fn compile_psync_command(_: &[Token]) -> Result<Command> {
@@ -205,9 +219,9 @@ mod tests {
 
     #[test]
     fn test_parse_replconf() {
-        let message = b"*1\r\n$8\r\nreplconf\r\n";
+        let message = b"*3\r\n$8\r\nreplconf\r\n$3\r\nack\r\n$2\r\n42\r\n";
         let result = parse_command(message).unwrap();
-        assert_eq!(result.command, Command::ReplConf);
+        assert_eq!(result.command, Command::ReplConf("ack".to_string(), 42));
         assert_eq!(result.len, message.len());
     }
 

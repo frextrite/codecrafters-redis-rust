@@ -7,7 +7,7 @@ use std::{str, thread};
 
 use clap::Parser;
 use redis_starter_rust::network::connection::{Connection, ConnectionError, ConnectionResult};
-use redis_starter_rust::parser::command::{parse_command, Command};
+use redis_starter_rust::parser::command::{parse_command, Command, ReplConfCommand};
 use redis_starter_rust::parser::rdb::parse_rdb_payload;
 use redis_starter_rust::parser::resp::parse_buffer;
 use redis_starter_rust::parser::resp::Token;
@@ -191,28 +191,27 @@ fn handle_command(
             )))?,
             _ => panic!("Not expecting to receive section other than replication"),
         },
-        Command::ReplConf(replconf_type, offset) => {
+        Command::ReplConf(replconf_command) => {
             println!(
-                "DEBUG: received REPLCONF command with type {} and offset {}",
-                replconf_type, offset
+                "DEBUG: received REPLCONF command {:?}",
+                replconf_command
             );
             // TODO: Handle REPLCONF command validation before sending responses
             if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-                if replconf_type.eq_ignore_ascii_case("ack") {
-                    println!("DEBUG: received ACK from replica");
-                    state
-                        .replica_manager
-                        .lock()
-                        .unwrap()
-                        .update_replica_offset(stream, *offset);
-                }
-
-                // Send OK as a response to REPLCONF listening-port or REPLCONF capa
-                if replconf_type.eq_ignore_ascii_case("listening-port")
-                    || replconf_type.eq_ignore_ascii_case("capa")
-                {
-                    println!("DEBUG: sending OK response to REPLCONF");
-                    stream.write_all(&serialize_to_simplestring(b"OK"))?
+                match replconf_command {
+                    ReplConfCommand::Ack(offset) => {
+                        println!("DEBUG: received ACK from replica");
+                        state
+                            .replica_manager
+                            .lock()
+                            .unwrap()
+                            .update_replica_offset(stream, *offset);
+                    }
+                    ReplConfCommand::ListeningPort(_) | ReplConfCommand::Capa(_) => {
+                        println!("DEBUG: sending OK response to REPLCONF");
+                        stream.write_all(&serialize_to_simplestring(b"OK"))?
+                    }
+                    _ => {}
                 }
             } else if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref() {
                 // Send REPLCONF ACK as a response to REPLCONF GETACK

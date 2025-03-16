@@ -9,8 +9,8 @@ use clap::Parser;
 use redis_starter_rust::network::connection::{Connection, ConnectionError, ConnectionResult};
 use redis_starter_rust::parser::command::{parse_command, Command, ReplConfCommand};
 use redis_starter_rust::parser::rdb::parse_rdb_payload;
-use redis_starter_rust::parser::resp::parse_buffer;
 use redis_starter_rust::parser::resp::Token;
+use redis_starter_rust::parser::resp::{parse_buffer, ParseError};
 use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
 use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
 use redis_starter_rust::state;
@@ -344,7 +344,7 @@ fn handle_client_disconnect(stream: &TcpStream, state: &State) {
 
 fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result<()> {
     loop {
-        match conn.try_parse(parse_command) {
+        match parse_command(conn.get_buffer()) {
             Ok(result) => {
                 let command = result.command;
                 handle_command(&command, &mut conn.stream, state.clone())?;
@@ -355,27 +355,13 @@ fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result
                 }
                 conn.consume(result.len);
             }
-            Err(err) => match err {
-                ConnectionError::Io(io_err) => {
-                    eprintln!(
-                        "ERROR: failed to read from connection {:?} with error {:?}",
-                        conn.stream.peer_addr(),
-                        io_err
-                    );
-                    match io_err.kind() {
-                        std::io::ErrorKind::Interrupted => continue,
-                        _ => break,
-                    }
-                }
-                ConnectionError::Parse(parse_err) => {
-                    eprintln!(
-                        "ERROR: failed to parse message {:?} with error {:?}",
-                        conn.get_buffer(),
-                        parse_err
-                    );
-                    break;
-                }
-            },
+            Err(ParseError::Incomplete) => conn.read_message()?, // Not enough data to parse the command
+            Err(ParseError::Invalid) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Invalid message format",
+                ));
+            }
         }
     }
     // TOOD: Instead of calling remove_replica unconditionally, propagate replica status for the client here
@@ -395,7 +381,7 @@ fn send_req(req: &[u8], conn: &mut Connection, command: &str) -> std::io::Result
         command,
         std::str::from_utf8(req).unwrap()
     );
-    conn.write_to_stream(req)?;
+    conn.write_message(req)?;
     Ok(())
 }
 
@@ -404,42 +390,64 @@ fn send_req(req: &[u8], conn: &mut Connection, command: &str) -> std::io::Result
 // and panics in case the message is not as expected.
 // Modify this to propagate information to the caller.
 fn parse_and_validate_psync_response(conn: &mut Connection) {
-    match conn.try_parse(parse_buffer) {
-        Ok(result) => {
-            if result.tokens.len() != 1 {
-                panic!(
-                    "Expected 1 token in PSYNC response but received {}",
-                    result.tokens.len()
-                );
+    // Read and validate PSYNC response
+    let result = loop {
+        let message = conn.get_buffer();
+        match parse_buffer(message) {
+            Ok(result) => break result,
+            Err(ParseError::Incomplete) => {
+                conn.read_message().unwrap();
             }
-            match result.tokens.first().unwrap() {
-                Token::SimpleString(data) => {
-                    let data = std::str::from_utf8(data.as_bytes()).unwrap();
-                    if data.starts_with("FULLRESYNC") {
-                        println!("INFO: received FULLRESYNC from master: {:?}", data);
-                    } else {
-                        panic!("Expected FULLRESYNC but received {:?}", data);
-                    }
-                }
-                _ => panic!(
-                    "Expected SimpleString but received {:?}",
-                    result.tokens.first().unwrap()
-                ),
+            Err(err) => {
+                eprintln!("ERROR: failed to parse PSYNC response with error {:?}", err);
+                panic!("Failed to parse PSYNC response");
             }
-            conn.consume(result.len);
         }
-        Err(err) => panic!("Failed to parse PSYNC response with error {:?}", err),
     };
-    match conn.try_parse(parse_rdb_payload) {
-        Ok(result) => {
-            println!(
-                "DEBUG: successfully parsed RDB payload with length {}",
-                result.len
-            );
-            conn.consume(result.len);
+
+    if result.tokens.len() != 1 {
+        panic!(
+            "Expected 1 token in PSYNC response but received {}",
+            result.tokens.len()
+        );
+    }
+
+    match result.tokens.first().unwrap() {
+        Token::SimpleString(data) => {
+            let data = std::str::from_utf8(data.as_bytes()).unwrap();
+            if data.starts_with("FULLRESYNC") {
+                println!("INFO: received FULLRESYNC from master: {:?}", data);
+            } else {
+                panic!("Expected FULLRESYNC but received {:?}", data);
+            }
         }
-        Err(err) => panic!("Failed to parse RDB payload with error {:?}", err),
+        _ => panic!(
+            "Expected SimpleString but received {:?}",
+            result.tokens.first().unwrap()
+        ),
+    }
+    conn.consume(result.len);
+
+    // Read and validate RDB payload
+    let rdb_payload = loop {
+        let message = conn.get_buffer();
+        match parse_rdb_payload(message) {
+            Ok(result) => break result,
+            Err(ParseError::Incomplete) => {
+                conn.read_message().unwrap();
+            }
+            Err(err) => {
+                eprintln!("ERROR: failed to parse RDB payload with error {:?}", err);
+                panic!("Failed to parse RDB payload");
+            }
+        }
     };
+
+    println!(
+        "DEBUG: successfully parsed RDB payload with length {}",
+        rdb_payload.len
+    );
+    conn.consume(rdb_payload.len);
 }
 
 fn send_req_and_validate_simple_string_resp(
@@ -448,18 +456,42 @@ fn send_req_and_validate_simple_string_resp(
     command: &str,
     expected: &str,
 ) -> ConnectionResult<()> {
+    // send the request
     send_req(req, conn, command)?;
-    let resp = conn.try_parse(parse_buffer)?;
-    if resp.tokens.len() != 1
-        || resp.tokens.first().unwrap() != &Token::SimpleString(expected.to_string())
-    {
-        panic!(
-            "Expected SimpleString {:?} but received {:?}",
-            expected,
-            resp.tokens.first()
-        );
+
+    // read the response
+    let tokens = loop {
+        let message = conn.get_buffer();
+        match parse_buffer(message) {
+            Ok(result) => {
+                conn.consume(result.len);
+                break result.tokens;
+            }
+            Err(ParseError::Incomplete) => conn.read_message()?,
+            Err(err) => {
+                eprintln!(
+                    "ERROR: failed to parse response for command {} with error {:?}",
+                    command, err
+                );
+                return Err(ConnectionError::Parse(err));
+            }
+        }
+    };
+
+    println!(
+        "DEBUG: received response for command {}: {:?}",
+        command, tokens
+    );
+
+    if tokens.len() != 1 {
+        return Err(ConnectionError::Parse(ParseError::Invalid));
     }
-    conn.consume(resp.len);
+
+    match &tokens[0] {
+        Token::SimpleString(resp) if resp.to_lowercase() == expected.to_lowercase() => (),
+        _ => return Err(ConnectionError::Parse(ParseError::Invalid)),
+    };
+
     Ok(())
 }
 

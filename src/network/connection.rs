@@ -1,10 +1,11 @@
 use crate::parser::resp::ParseError;
-use crate::parser::resp::Result;
 use std::io;
 use std::io::Write;
 use std::{io::Read, net::TcpStream};
 
 pub type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
+
+const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
 
 #[derive(Debug)]
 pub enum ConnectionError {
@@ -21,61 +22,61 @@ impl From<std::io::Error> for ConnectionError {
 pub struct Connection {
     pub stream: TcpStream,
     buffer: Vec<u8>,
-    offset: usize,
-}
-
-impl Connection {
-    fn read_from_stream(&mut self) -> io::Result<usize> {
-        let read = self.stream.read(&mut self.buffer[self.offset..])?;
-        self.offset += read;
-        Ok(read)
-    }
 }
 
 impl Connection {
     pub fn new(stream: TcpStream) -> Self {
         Self {
             stream,
-            buffer: vec![0; 4096],
-            offset: 0,
+            buffer: Vec::new(),
         }
     }
 
     pub fn from_existing(stream: TcpStream, buffer: &[u8]) -> Self {
         let mut conn = Self::new(stream);
         conn.buffer[..buffer.len()].copy_from_slice(buffer);
-        conn.offset = buffer.len();
         conn
     }
 
-    pub fn write_to_stream(&mut self, data: &[u8]) -> io::Result<()> {
-        self.stream.write_all(data)?;
+    pub fn read_message(&mut self) -> io::Result<()> {
+        let mut buffer = vec![0u8; 1024];
+
+        let bytes_read = loop {
+            match self.stream.read(&mut buffer) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Connection closed",
+                    ))
+                }
+                Ok(n) => break n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        };
+
+        self.buffer.extend_from_slice(&buffer[..bytes_read]);
+
+        if self.buffer.len() > MAX_MESSAGE_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Message size exceeds limit",
+            ));
+        }
+
         Ok(())
     }
 
-    pub fn get_buffer(&self) -> &[u8] {
-        &self.buffer[..self.offset]
+    pub fn write_message(&mut self, message: &[u8]) -> io::Result<()> {
+        self.stream.write_all(message)?;
+        Ok(())
     }
 
     pub fn consume(&mut self, n: usize) {
-        self.offset -= n;
-        for i in 0..self.offset {
-            self.buffer[i] = self.buffer[i + n];
-        }
+        self.buffer.drain(..n);
     }
 
-    pub fn try_parse<F, T>(&mut self, f: F) -> ConnectionResult<T>
-    where
-        F: Fn(&[u8]) -> Result<T>,
-    {
-        loop {
-            match f(&self.buffer[..self.offset]) {
-                Ok(value) => return Ok(value),
-                Err(ParseError::Incomplete) => {
-                    self.read_from_stream()?;
-                }
-                Err(e) => return Err(ConnectionError::Parse(e)),
-            }
-        }
+    pub fn get_buffer(&self) -> &[u8] {
+        &self.buffer
     }
 }

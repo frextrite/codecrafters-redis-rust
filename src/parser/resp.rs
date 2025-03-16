@@ -64,7 +64,7 @@ impl From<std::str::Utf8Error> for ParseError {
 }
 
 pub fn find_first_crlf(message: &[u8]) -> Option<usize> {
-    (0..message.len() - 1).find(|&i| message[i] == CR && message[i + 1] == LF)
+    message.windows(2).position(|window| window == [CR, LF])
 }
 
 fn bytes_to_unsigned(bytes: &[u8]) -> Result<usize> {

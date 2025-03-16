@@ -43,93 +43,102 @@ fn compile_ping_command(_: &[Token]) -> Result<Command> {
 }
 
 fn compile_echo_command(tokens: &[Token]) -> Result<Command> {
-    let data = match tokens.first() {
-        Some(Token::BulkString(data)) => data.clone(),
+    match tokens {
+        [Token::BulkString(data)] => Ok(Command::Echo(data.clone())),
         _ => Err(ParseError::Invalid)?,
-    };
-    Ok(Command::Echo(data))
+    }
 }
 
 fn compile_get_command(tokens: &[Token]) -> Result<Command> {
-    let key = match tokens.first() {
-        Some(Token::BulkString(key)) => key.clone(),
+    match tokens {
+        [Token::BulkString(key)] => Ok(Command::Get(key.clone())),
         _ => Err(ParseError::Invalid)?,
-    };
-    Ok(Command::Get(key))
+    }
 }
 
 fn compile_set_command(tokens: &[Token]) -> Result<Command> {
-    let mut tokens = tokens.iter();
-    let key = match tokens.next() {
-        Some(Token::BulkString(key)) => key.clone(),
-        _ => Err(ParseError::Invalid)?,
-    };
-    let value = match tokens.next() {
-        Some(Token::BulkString(value)) => value.clone(),
-        _ => Err(ParseError::Invalid)?,
-    };
-    let expiry = match tokens.next() {
-        Some(Token::BulkString(expiry)) => {
-            let expiry = std::str::from_utf8(expiry)?;
-            assert!(expiry.to_lowercase() == "px");
-            let millis = std::str::from_utf8(
-                tokens
-                    .next()
-                    .ok_or(ParseError::Invalid)?
-                    .get_bulk_string_data()?,
-            )?
-            .parse()?;
-            Some(Duration::from_millis(millis))
+    match tokens {
+        [Token::BulkString(key), Token::BulkString(value), rest @ ..] => {
+            let mut expiry = None;
+            let mut iter = rest.iter();
+            while let Some(token) = iter.next() {
+                match token {
+                    Token::BulkString(arg) => {
+                        let arg = std::str::from_utf8(arg)?.to_lowercase();
+                        match arg.as_str() {
+                            "px" => {
+                                if let Some(Token::BulkString(expiry_value)) = iter.next() {
+                                    let millis = std::str::from_utf8(expiry_value)?.parse()?;
+                                    expiry = Some(Duration::from_millis(millis));
+                                } else {
+                                    return Err(ParseError::Invalid)?;
+                                }
+                            }
+                            _ => {
+                                unimplemented!("Unsupported argument: {}", arg);
+                            }
+                        }
+                    }
+                    _ => return Err(ParseError::Invalid)?,
+                }
+            }
+            Ok(Command::Set {
+                key: key.clone(),
+                value: value.clone(),
+                expiry,
+            })
         }
-        Some(_) => Err(ParseError::Invalid)?,
-        None => None,
-    };
-    Ok(Command::Set { key, value, expiry })
+        _ => Err(ParseError::Invalid)?,
+    }
 }
 
 fn compile_info_command(tokens: &[Token]) -> Result<Command> {
-    let section = match tokens.first() {
-        Some(Token::BulkString(section)) => section.clone(),
+    match tokens {
+        [Token::BulkString(section)] => Ok(Command::Info(section.clone())),
         _ => Err(ParseError::Invalid)?,
-    };
-    Ok(Command::Info(section))
+    }
 }
 
 fn compile_replconf_command(tokens: &[Token]) -> Result<Command> {
-    let mut tokens = tokens.iter();
-    let replconf_type = match tokens.next() {
-        Some(Token::BulkString(replconf_type)) => {
-            std::str::from_utf8(replconf_type)?.to_ascii_lowercase()
+    match tokens {
+        [Token::BulkString(replconf_type), rest @ ..] => {
+            let replconf_type = std::str::from_utf8(replconf_type)?.to_ascii_lowercase();
+            let command = match replconf_type.as_str() {
+                "ack" => match rest {
+                    [Token::BulkString(offset)] => {
+                        ReplConfCommand::Ack(std::str::from_utf8(offset)?.parse()?)
+                    }
+                    _ => Err(ParseError::Invalid)?,
+                },
+                "listening-port" => match rest {
+                    [Token::BulkString(port)] => {
+                        ReplConfCommand::ListeningPort(std::str::from_utf8(port)?.parse()?)
+                    }
+                    _ => Err(ParseError::Invalid)?,
+                },
+                "capa" => match rest {
+                    [Token::BulkString(capa)] => {
+                        ReplConfCommand::Capa(std::str::from_utf8(capa)?.to_string())
+                    }
+                    _ => Err(ParseError::Invalid)?,
+                },
+                "getack" => match rest {
+                    [Token::BulkString(ack)] => {
+                        ReplConfCommand::GetAck(std::str::from_utf8(ack)?.to_string())
+                    }
+                    _ => Err(ParseError::Invalid)?,
+                },
+                _ => {
+                    assert!(rest.is_empty());
+                    // If there are no more tokens, we can safely ignore them
+                    // and return the command as Other
+                    ReplConfCommand::Other(replconf_type)
+                }
+            };
+            Ok(Command::ReplConf(command))
         }
         _ => Err(ParseError::Invalid)?,
-    };
-    let command = match replconf_type.as_str() {
-        "ack" => match tokens.next() {
-            Some(Token::BulkString(offset)) => {
-                ReplConfCommand::Ack(std::str::from_utf8(offset)?.parse()?)
-            }
-            _ => Err(ParseError::Invalid)?,
-        },
-        "listening-port" => match tokens.next() {
-            Some(Token::BulkString(port)) => {
-                ReplConfCommand::ListeningPort(std::str::from_utf8(port)?.parse()?)
-            }
-            _ => Err(ParseError::Invalid)?,
-        },
-        "capa" => match tokens.next() {
-            Some(Token::BulkString(capa)) => ReplConfCommand::Capa(std::str::from_utf8(capa)?.to_string()),
-            _ => Err(ParseError::Invalid)?,
-        },
-        "getack" => match tokens.next() {
-            Some(Token::BulkString(ack)) => ReplConfCommand::GetAck(std::str::from_utf8(ack)?.to_string()),
-            _ => Err(ParseError::Invalid)?,
-        },
-        s => {
-            assert!(tokens.next().is_none());
-            ReplConfCommand::Other(s.to_string())
-        }
-    };
-    Ok(Command::ReplConf(command))
+    }
 }
 
 fn compile_psync_command(_: &[Token]) -> Result<Command> {
@@ -137,21 +146,17 @@ fn compile_psync_command(_: &[Token]) -> Result<Command> {
 }
 
 fn compile_wait_command(tokens: &[Token]) -> Result<Command> {
-    let mut tokens = tokens.iter();
-    let replica_count = match tokens.next() {
-        Some(Token::BulkString(count)) => std::str::from_utf8(count)?.parse()?,
-        _ => Err(ParseError::Invalid)?,
-    };
-    let timeout = match tokens.next() {
-        Some(Token::BulkString(timeout)) => {
-            Duration::from_millis(std::str::from_utf8(timeout)?.parse()?)
+    match tokens {
+        [Token::BulkString(replica_count), Token::BulkString(timeout)] => {
+            let replica_count = std::str::from_utf8(replica_count)?.parse()?;
+            let timeout = Duration::from_millis(std::str::from_utf8(timeout)?.parse()?);
+            Ok(Command::Wait {
+                replica_count,
+                timeout,
+            })
         }
         _ => Err(ParseError::Invalid)?,
-    };
-    Ok(Command::Wait {
-        replica_count,
-        timeout,
-    })
+    }
 }
 
 fn compile_and_get_command(tokens: &[Token]) -> Result<Command> {
@@ -257,7 +262,10 @@ mod tests {
     fn test_parse_replconf_listening_port() {
         let message = b"*3\r\n$8\r\nreplconf\r\n$14\r\nlistening-port\r\n$4\r\n4242\r\n";
         let result = parse_command(message).unwrap();
-        assert_eq!(result.command, Command::ReplConf(ReplConfCommand::ListeningPort(4242)));
+        assert_eq!(
+            result.command,
+            Command::ReplConf(ReplConfCommand::ListeningPort(4242))
+        );
         assert_eq!(result.len, message.len());
     }
 
@@ -265,7 +273,10 @@ mod tests {
     fn test_parse_replconf_capa() {
         let message = b"*3\r\n$8\r\nreplconf\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n";
         let result = parse_command(message).unwrap();
-        assert_eq!(result.command, Command::ReplConf(ReplConfCommand::Capa("psync2".to_string())));
+        assert_eq!(
+            result.command,
+            Command::ReplConf(ReplConfCommand::Capa("psync2".to_string()))
+        );
         assert_eq!(result.len, message.len());
     }
 

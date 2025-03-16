@@ -192,10 +192,7 @@ fn handle_command(
             _ => panic!("Not expecting to receive section other than replication"),
         },
         Command::ReplConf(replconf_command) => {
-            println!(
-                "DEBUG: received REPLCONF command {:?}",
-                replconf_command
-            );
+            println!("DEBUG: received REPLCONF command {:?}", replconf_command);
             // TODO: Handle REPLCONF command validation before sending responses
             if let ReplicaInfo::Master(_) = state.metadata.replica_info {
                 match replconf_command {

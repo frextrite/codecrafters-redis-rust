@@ -64,99 +64,84 @@ impl From<std::str::Utf8Error> for ParseError {
 }
 
 pub fn find_first_crlf(message: &[u8]) -> Option<usize> {
-    if message.len() < 2 {
-        return None;
-    }
     (0..message.len() - 1).find(|&i| message[i] == CR && message[i + 1] == LF)
 }
 
-fn bytes_to_unsigned(bytes: &[u8]) -> Option<usize> {
-    let mut integer = 0;
-    for digit in bytes {
-        if digit.is_ascii_digit() {
-            integer = integer * 10 + (digit - b'0') as usize;
-        } else {
-            return None;
-        }
-    }
-
-    Some(integer)
+fn bytes_to_unsigned(bytes: &[u8]) -> Result<usize> {
+    Ok(std::str::from_utf8(bytes)?.parse::<usize>()?)
 }
 
-fn parse_bytes(message: &[u8], len: usize) -> Result<Vec<u8>> {
+fn parse_bytes(message: &[u8], len: usize) -> Result<&[u8]> {
     if len + 2 > message.len() {
         return Err(ParseError::Incomplete);
     }
     if message[len] != CR || message[len + 1] != LF {
         return Err(ParseError::Invalid);
     }
-    Ok(message[..len].to_vec())
+    Ok(&message[..len])
 }
 
 fn parse_bulk_string(message: &[u8]) -> Result<ParseResult> {
-    assert!(message.first().unwrap() == &b'$');
+    assert_eq!(message.first(), Some(&b'$'));
 
-    let crlf = find_first_crlf(message);
-    match crlf {
-        Some(mut len) => {
-            let n = bytes_to_unsigned(&message[1..len]).ok_or(ParseError::Invalid)?;
-            len += 2;
-            let data = parse_bytes(&message[len..], n)?;
-            len += n + 2;
-            Ok(ParseResult {
-                tokens: vec![Token::BulkString(data)],
-                len,
-            })
-        }
-        None => Err(ParseError::Incomplete),
-    }
+    let size_offset = find_first_crlf(message).ok_or(ParseError::Incomplete)?;
+    let data_size = bytes_to_unsigned(&message[1..size_offset])?;
+    let data_start = size_offset + 2; // Skip CRLF
+
+    let data = parse_bytes(&message[data_start..], data_size)?;
+    let offset = data_start + data_size + 2;
+
+    Ok(ParseResult {
+        tokens: vec![Token::BulkString(data.to_vec())],
+        len: offset,
+    })
 }
 
 fn parse_simple_string(message: &[u8]) -> Result<ParseResult> {
-    assert!(message.first().unwrap() == &b'+');
+    assert_eq!(message.first(), Some(&b'+'));
 
-    let crlf = find_first_crlf(message);
-    match crlf {
-        Some(len) => Ok(ParseResult {
-            tokens: vec![Token::SimpleString(
-                std::str::from_utf8(&message[1..len]).unwrap().to_owned(),
-            )],
-            len: len + 2,
-        }),
-        None => Err(ParseError::Incomplete),
-    }
+    let str_size = find_first_crlf(message).ok_or(ParseError::Incomplete)?;
+    let data = std::str::from_utf8(&message[1..str_size])?;
+
+    Ok(ParseResult {
+        tokens: vec![Token::SimpleString(data.to_owned())],
+        len: str_size + 2,
+    })
 }
 
 fn parse_array(message: &[u8]) -> Result<ParseResult> {
-    assert!(message.first().unwrap() == &b'*');
+    assert_eq!(message.first(), Some(&b'*'));
 
-    let mut tokens = vec![];
-    let crlf = find_first_crlf(message);
-    match crlf {
-        Some(mut len) => {
-            let n = bytes_to_unsigned(&message[1..len]).ok_or(ParseError::Invalid)?;
-            len += 2;
-            for _ in 0..n {
-                let mut res = parse_buffer(&message[len..])?;
-                tokens.append(&mut res.tokens);
-                len += res.len;
-            }
-            Ok(ParseResult { tokens, len })
-        }
-        None => Err(ParseError::Incomplete),
+    let size_offset = find_first_crlf(message).ok_or(ParseError::Incomplete)?;
+    let num_elements = bytes_to_unsigned(&message[1..size_offset])?;
+
+    let mut offset = size_offset + 2;
+    let mut tokens = Vec::with_capacity(num_elements);
+
+    for _ in 0..num_elements {
+        let mut res = parse_buffer(&message[offset..])?;
+        tokens.append(&mut res.tokens);
+        offset += res.len;
     }
+
+    Ok(ParseResult {
+        tokens,
+        len: offset,
+    })
 }
 
 pub fn parse_buffer(buffer: &[u8]) -> Result<ParseResult> {
-    match buffer.first() {
-        Some(b'*') => parse_array(buffer),
-        Some(b'+') => parse_simple_string(buffer),
-        Some(b'$') => parse_bulk_string(buffer),
-        Some(byte) => unimplemented!(
-            "parser does not support parsing messages starting with {:?}",
-            byte
-        ),
-        None => Err(ParseError::Incomplete),
+    match buffer {
+        [first_byte, ..] => match first_byte {
+            b'*' => parse_array(buffer),
+            b'+' => parse_simple_string(buffer),
+            b'$' => parse_bulk_string(buffer),
+            byte => unimplemented!(
+                "parser does not support parsing messages starting with {:?}",
+                byte
+            ),
+        },
+        [] => Err(ParseError::Incomplete),
     }
 }
 

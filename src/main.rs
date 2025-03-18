@@ -13,7 +13,7 @@ use redis_starter_rust::parser::resp::Token;
 use redis_starter_rust::parser::resp::{parse_buffer, ParseError};
 use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
 use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
-use redis_starter_rust::state;
+use redis_starter_rust::storage::expiring_map::ExpiringHashMap;
 
 const HOST: &str = "127.0.0.1";
 #[allow(dead_code)]
@@ -103,7 +103,7 @@ struct State {
     metadata: ServerMetadata,
     replica_manager: Mutex<ReplicaManager>,
     live_data: Mutex<LiveData>,
-    store: Mutex<state::ExpiringHashMap>,
+    store: Mutex<ExpiringHashMap>,
 }
 
 impl State {
@@ -113,7 +113,7 @@ impl State {
             metadata,
             replica_manager: Mutex::new(ReplicaManager::new()),
             live_data,
-            store: Mutex::new(state::ExpiringHashMap::new()),
+            store: Mutex::new(ExpiringHashMap::new()),
         }
     }
 

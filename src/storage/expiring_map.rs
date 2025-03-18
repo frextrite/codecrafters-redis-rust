@@ -12,7 +12,7 @@ type ValueType = (BinaryData, Expiry);
 type Store = RwLock<HashMap<KeyType, ValueType>>;
 type StopCondition = (Mutex<bool>, Condvar);
 
-const SLEEP_TIMEOUT: Duration = Duration::from_secs(60);
+const CLEANUP_INTERNAL: Duration = Duration::from_secs(60);
 
 pub struct ExpiringHashMap {
     store: Arc<Store>,
@@ -39,64 +39,17 @@ impl Default for ExpiringHashMap {
 
 impl ExpiringHashMap {
     pub fn new() -> Self {
-        let mut map = ExpiringHashMap {
-            store: Arc::new(RwLock::new(HashMap::new())),
-            gc_stop: Arc::new((Mutex::new(false), Condvar::new())),
+        let store = Arc::new(RwLock::new(HashMap::new()));
+        let gc_stop = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let mut map = Self {
+            store,
+            gc_stop,
             gc_handle: None,
         };
 
         map.start_gc_thread();
-
         map
-    }
-
-    fn start_gc_thread(&mut self) {
-        let store = self.store.clone();
-        let gc_stop = self.gc_stop.clone();
-
-        self.gc_handle = Some(thread::spawn(move || {
-            Self::gc_thread_function(store, gc_stop);
-        }));
-    }
-
-    fn gc_thread_function(store: Arc<Store>, gc_stop: Arc<StopCondition>) {
-        loop {
-            let (gc_stop_requested, _) = &*gc_stop;
-            let stop_requested = *gc_stop_requested.lock().unwrap();
-            if stop_requested {
-                println!("INFO: stopping GC thread");
-                break;
-            }
-
-            let num_expired_keys = Self::cleanup_expired_keys(store.clone());
-
-            if num_expired_keys > 0 {
-                println!("INFO: cleaned up {} expired keys", num_expired_keys);
-            }
-
-            let (gc_stop_requested, gc_stop_cv) = &*gc_stop;
-            let _ = gc_stop_cv.wait_timeout(gc_stop_requested.lock().unwrap(), SLEEP_TIMEOUT);
-        }
-    }
-
-    fn cleanup_expired_keys(store: Arc<Store>) -> usize {
-        let mut store = store.write().unwrap();
-
-        let current_time = Instant::now();
-        let mut num_expired_keys = 0;
-
-        store.retain(|_, (_, expiry)| {
-            if let Some(expiry) = expiry.as_ref() {
-                if expiry < &current_time {
-                    num_expired_keys += 1;
-                    return false;
-                }
-            }
-
-            true
-        });
-
-        num_expired_keys
     }
 
     pub fn get(&self, key: &[u8]) -> Option<BinaryData> {
@@ -122,5 +75,56 @@ impl ExpiringHashMap {
 
     fn calculate_ttl(expiry: Option<Duration>) -> Option<Instant> {
         expiry.and_then(|duration| Instant::now().checked_add(duration))
+    }
+}
+
+impl ExpiringHashMap {
+    fn start_gc_thread(&mut self) {
+        let store = self.store.clone();
+        let gc_stop = self.gc_stop.clone();
+
+        self.gc_handle = Some(thread::spawn(move || {
+            Self::gc_thread_function(store, gc_stop);
+        }));
+    }
+
+    fn gc_thread_function(store: Arc<Store>, gc_stop: Arc<StopCondition>) {
+        loop {
+            let (gc_stop_requested, _) = &*gc_stop;
+            let stop_requested = *gc_stop_requested.lock().unwrap();
+            if stop_requested {
+                println!("INFO: stopping GC thread");
+                break;
+            }
+
+            let num_expired_keys = Self::cleanup_expired_keys(store.clone());
+
+            if num_expired_keys > 0 {
+                println!("INFO: cleaned up {} expired keys", num_expired_keys);
+            }
+
+            let (gc_stop_requested, gc_stop_cv) = &*gc_stop;
+            let _ = gc_stop_cv.wait_timeout(gc_stop_requested.lock().unwrap(), CLEANUP_INTERNAL);
+        }
+    }
+
+    fn cleanup_expired_keys(store: Arc<Store>) -> usize {
+        let mut store = store.write().unwrap();
+
+        let current_time = Instant::now();
+        let mut num_expired_keys = 0;
+
+        store.retain(|_, (_, expiry)| {
+            if let Some(expiry) = expiry.as_ref() {
+                if expiry < &current_time {
+                    num_expired_keys += 1;
+                    return false;
+                }
+            }
+
+            true
+        });
+
+        num_expired_keys
     }
 }

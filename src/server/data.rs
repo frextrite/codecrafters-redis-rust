@@ -35,17 +35,17 @@ impl LiveData {
     }
 }
 
-pub struct State {
+pub struct Server {
     pub metadata: ServerMetadata,
     pub replica_manager: Mutex<ReplicaManager>,
     pub live_data: Mutex<LiveData>,
     pub store: Mutex<ExpiringHashMap>,
 }
 
-impl State {
-    pub fn new(metadata: ServerMetadata) -> State {
+impl Server {
+    pub fn new(metadata: ServerMetadata) -> Server {
         let live_data = Mutex::new(LiveData::new(&metadata.replica_info));
-        State {
+        Server {
             metadata,
             replica_manager: Mutex::new(ReplicaManager::new()),
             live_data,

@@ -6,18 +6,18 @@ use crate::parser::command::ReplConfCommand;
 use crate::parser::resp::Token;
 use crate::replication::rdb::{get_empty_rdb, serialize_rdb};
 use crate::replication::replica_manager::Replica;
-use crate::server::state::LiveData;
+use crate::server::data::LiveData;
 use crate::{parser::command::Command, server::metadata::ReplicaInfo};
 
-use super::state::State;
+use super::data::Server;
 
 pub struct CommandHandler {
     stream: TcpStream,
-    state: Arc<State>,
+    state: Arc<Server>,
 }
 
 impl CommandHandler {
-    pub fn new(stream: TcpStream, state: Arc<State>) -> Self {
+    pub fn new(stream: TcpStream, state: Arc<Server>) -> Self {
         CommandHandler { stream, state }
     }
 

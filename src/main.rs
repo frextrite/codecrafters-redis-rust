@@ -11,9 +11,9 @@ use redis_starter_rust::parser::rdb::parse_rdb_payload;
 use redis_starter_rust::parser::resp::Token;
 use redis_starter_rust::parser::resp::{parse_buffer, ParseError};
 use redis_starter_rust::server::config::Config;
+use redis_starter_rust::server::data::{LiveData, Server};
 use redis_starter_rust::server::handler::CommandHandler;
 use redis_starter_rust::server::metadata::{ReplicaInfo, ServerMetadata};
-use redis_starter_rust::server::state::{LiveData, State};
 
 const HOST: &str = "127.0.0.1";
 
@@ -36,8 +36,8 @@ fn serialize_to_bulkstring(data: Option<&[u8]>) -> Vec<u8> {
     }
 }
 
-fn handle_client_disconnect(stream: &TcpStream, state: &State) {
-    if state
+fn handle_client_disconnect(stream: &TcpStream, server: &Server) {
+    if server
         .replica_manager
         .lock()
         .unwrap()
@@ -51,8 +51,8 @@ fn handle_client_disconnect(stream: &TcpStream, state: &State) {
     }
 }
 
-fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result<()> {
-    let mut handler = CommandHandler::new(conn.stream.try_clone()?, state.clone());
+fn handle_connection(mut conn: Connection, server: Arc<Server>) -> std::io::Result<()> {
+    let mut handler = CommandHandler::new(conn.stream.try_clone()?, server.clone());
 
     loop {
         match parse_command(conn.get_buffer()) {
@@ -61,7 +61,7 @@ fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result
 
                 handler.handle_command(&command)?;
 
-                if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref_mut() {
+                if let LiveData::Slave(data) = server.live_data.lock().unwrap().deref_mut() {
                     data.offset += result.len;
                 }
                 conn.consume(result.len);
@@ -80,8 +80,8 @@ fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result
     //
     // We cannot know whether there is atleast one replica listening for commands since this
     // information is only known by replication sub-system, hence propagate all commands
-    if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-        handle_client_disconnect(&conn.stream, state.deref());
+    if let ReplicaInfo::Master(_) = server.metadata.replica_info {
+        handle_client_disconnect(&conn.stream, server.deref());
     }
     Ok(())
 }
@@ -210,7 +210,7 @@ fn initiate_replication_as_slave(
     host: String,
     port: u16,
     host_port: u16,
-    state: Arc<State>,
+    server: Arc<Server>,
 ) -> ConnectionResult<()> {
     println!("INFO: connecting to master at {}:{}", &host, port);
     {
@@ -252,13 +252,13 @@ fn initiate_replication_as_slave(
         println!("INFO: successfully initiated replication for slave");
 
         // Start replication
-        handle_connection(conn, state)?;
+        handle_connection(conn, server)?;
     }
     Ok(())
 }
 
-fn serve_clients(state: Arc<State>) -> anyhow::Result<()> {
-    let listening_port = state.metadata.listening_port;
+fn serve_clients(server: Arc<Server>) -> anyhow::Result<()> {
+    let listening_port = server.metadata.listening_port;
 
     let addr = (HOST, listening_port);
     let listener = TcpListener::bind(addr)?;
@@ -273,8 +273,8 @@ fn serve_clients(state: Arc<State>) -> anyhow::Result<()> {
                     stream.peer_addr()
                 );
                 let conn = Connection::new(stream);
-                let state = state.clone();
-                std::thread::spawn(|| handle_connection(conn, state).unwrap());
+                let server = server.clone();
+                std::thread::spawn(|| handle_connection(conn, server).unwrap());
             }
             Err(error) => {
                 eprintln!(
@@ -293,21 +293,21 @@ fn main() -> anyhow::Result<()> {
     println!("DEBUG: parsed cli args: {:?}", config);
 
     let metadata = ServerMetadata::generate(&config);
-    let state = Arc::new(State::new(metadata));
+    let server = Arc::new(Server::new(metadata));
 
     // start replication
-    if let ReplicaInfo::Slave(ref info) = state.metadata.replica_info {
+    if let ReplicaInfo::Slave(ref info) = server.metadata.replica_info {
         println!("INFO: starting replication as slave");
 
         let master_host = info.master_host.clone();
         let master_port = info.master_port;
-        let state = state.clone();
+        let server = server.clone();
         std::thread::spawn(move || {
             let result = initiate_replication_as_slave(
                 master_host,
                 master_port,
-                state.metadata.listening_port,
-                state,
+                server.metadata.listening_port,
+                server,
             );
             if let Err(err) = result {
                 eprintln!("ERROR: replication failed with error {:?}", err);
@@ -316,7 +316,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // start server
-    serve_clients(state.clone())?;
+    serve_clients(server.clone())?;
 
     Ok(())
 }

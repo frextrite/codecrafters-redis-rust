@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use std::{str, thread};
 
 use clap::Parser;
+use redis_starter_rust::common::CRLF;
 use redis_starter_rust::network::connection::{Connection, ConnectionError, ConnectionResult};
 use redis_starter_rust::parser::command::{parse_command, Command, ReplConfCommand};
 use redis_starter_rust::parser::rdb::parse_rdb_payload;
@@ -13,6 +14,8 @@ use redis_starter_rust::parser::resp::Token;
 use redis_starter_rust::parser::resp::{parse_buffer, ParseError};
 use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
 use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
+use redis_starter_rust::server::config::Config;
+use redis_starter_rust::server::metadata::{self, ReplicaInfo, ServerMetadata};
 use redis_starter_rust::storage::expiring_map::ExpiringHashMap;
 
 const HOST: &str = "127.0.0.1";
@@ -20,7 +23,6 @@ const HOST: &str = "127.0.0.1";
 const CR: u8 = b'\r';
 #[allow(dead_code)]
 const LF: u8 = b'\n';
-const CRLF: &str = "\r\n";
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -29,46 +31,6 @@ struct Cli {
     port: u16,
     #[arg(short, long)]
     replicaof: Option<String>,
-}
-
-#[derive(Debug)]
-struct MasterInfo {
-    replication_id: String,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-struct SlaveInfo {
-    master_host: String,
-    master_port: u16,
-}
-
-#[derive(Debug)]
-enum ReplicaInfo {
-    Master(MasterInfo),
-    Slave(SlaveInfo),
-}
-
-#[derive(Debug)]
-struct ServerMetadata {
-    replica_info: ReplicaInfo,
-}
-
-impl ServerMetadata {
-    fn get_replica_info(&self) -> Vec<u8> {
-        match &self.replica_info {
-            ReplicaInfo::Master(master_info) => {
-                format!(
-                    "role:master{CRLF}master_replid:{}{CRLF}master_repl_offset:{}",
-                    master_info.replication_id,
-                    0 // TODO: Add replication offset
-                )
-                .as_bytes()
-                .to_vec()
-            }
-            ReplicaInfo::Slave(_slave_info) => b"role:slave".to_vec(),
-        }
-    }
 }
 
 struct MasterLiveData {
@@ -546,52 +508,13 @@ fn initiate_replication_as_slave(
     Ok(())
 }
 
-fn initiate_replication(state: Arc<State>, host_port: u16) {
-    match &state.metadata.replica_info {
-        ReplicaInfo::Slave(info) => {
-            let host = info.master_host.clone();
-            let port = info.master_port;
-            std::thread::spawn(move || {
-                initiate_replication_as_slave(host, port, host_port, state).unwrap();
-            });
-        }
-        ReplicaInfo::Master(_) => println!("WARN: replication not implemented for master"),
-    }
-}
+fn serve_clients(state: Arc<State>) -> anyhow::Result<()> {
+    let listening_port = state.metadata.listening_port;
 
-fn generate_server_metadata(replica_info: Option<Vec<String>>) -> ServerMetadata {
-    match replica_info {
-        Some(info) => {
-            assert_eq!(info.len(), 2);
-            ServerMetadata {
-                replica_info: ReplicaInfo::Slave(SlaveInfo {
-                    master_host: info[0].clone(),
-                    master_port: info[1].parse().unwrap(),
-                }),
-            }
-        }
-        None => ServerMetadata {
-            replica_info: ReplicaInfo::Master(MasterInfo {
-                replication_id: "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string(),
-            }),
-        },
-    }
-}
+    let addr = (HOST, listening_port);
+    let listener = TcpListener::bind(addr)?;
 
-fn main() {
-    let args = Cli::parse();
-    println!("DEBUG: parsed cli args: {:?}", args);
-    let addr = (HOST, args.port);
-    let listener = TcpListener::bind(addr).unwrap();
-
-    println!("INFO: started listener on {:?}", addr);
-
-    let metadata = generate_server_metadata(
-        args.replicaof
-            .map(|info| info.split_whitespace().map(str::to_string).collect()),
-    );
-    let state = Arc::new(State::new(metadata));
-    initiate_replication(state.clone(), args.port);
+    println!("INFO: started listener on {:?}", listener.local_addr());
 
     for incoming_stream in listener.incoming() {
         match incoming_stream {
@@ -612,4 +535,39 @@ fn main() {
             }
         }
     }
+
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let config = Config::new();
+    println!("DEBUG: parsed cli args: {:?}", config);
+
+    let metadata = ServerMetadata::generate(&config);
+    let state = Arc::new(State::new(metadata));
+
+    // start replication
+    if let ReplicaInfo::Slave(ref info) = state.metadata.replica_info {
+        println!("INFO: starting replication as slave");
+
+        let master_host = info.master_host.clone();
+        let master_port = info.master_port;
+        let state = state.clone();
+        std::thread::spawn(move || {
+            let result = initiate_replication_as_slave(
+                master_host,
+                master_port,
+                state.metadata.listening_port,
+                state,
+            );
+            if let Err(err) = result {
+                eprintln!("ERROR: replication failed with error {:?}", err);
+            }
+        });
+    }
+
+    // start server
+    serve_clients(state.clone())?;
+
+    Ok(())
 }

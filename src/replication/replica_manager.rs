@@ -39,8 +39,8 @@ impl ReplicaManager {
             .insert(replica.conn.stream.peer_addr().unwrap(), replica)
     }
 
-    pub fn remove_replica(&mut self, addr: SocketAddr) -> Option<Replica> {
-        self.replicas.remove(&addr)
+    pub fn remove_replica(&mut self, conn: &Connection) -> Option<Replica> {
+        self.replicas.remove(&conn.stream.peer_addr().unwrap())
     }
 
     pub fn get_connected_replica_count(&self) -> usize {

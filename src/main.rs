@@ -1,5 +1,4 @@
 use std::net::{TcpListener, TcpStream};
-use std::ops::{Deref, DerefMut};
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,22 +35,7 @@ fn serialize_to_bulkstring(data: Option<&[u8]>) -> Vec<u8> {
     }
 }
 
-fn handle_client_disconnect(stream: &TcpStream, server: &Server) {
-    if server
-        .replica_manager
-        .lock()
-        .unwrap()
-        .remove_replica(stream.peer_addr().unwrap())
-        .is_some()
-    {
-        println!(
-            "INFO: successfully removed {:?} as a replica listener",
-            stream.peer_addr(),
-        );
-    }
-}
-
-fn handle_connection(mut conn: Connection, server: Arc<Server>) -> std::io::Result<()> {
+fn handle_read_loop(conn: &mut Connection, server: Arc<Server>) -> std::io::Result<()> {
     let mut handler = CommandHandler::new(conn.stream.try_clone()?, server.clone());
 
     loop {
@@ -61,7 +45,7 @@ fn handle_connection(mut conn: Connection, server: Arc<Server>) -> std::io::Resu
 
                 handler.handle_command(&command)?;
 
-                if let LiveData::Slave(data) = server.live_data.lock().unwrap().deref_mut() {
+                if let LiveData::Slave(data) = &mut *server.live_data.lock().unwrap() {
                     data.offset += result.len;
                 }
                 conn.consume(result.len);
@@ -75,13 +59,28 @@ fn handle_connection(mut conn: Connection, server: Arc<Server>) -> std::io::Resu
             }
         }
     }
+}
+
+fn handle_connection(mut conn: Connection, server: Arc<Server>) -> std::io::Result<()> {
+    match handle_read_loop(&mut conn, server.clone()) {
+        Ok(_) => {
+            println!("INFO: client disconnected");
+        }
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                println!("INFO: client disconnected");
+            } else {
+                eprintln!("ERROR: failed to handle connection with error {:?}", err);
+            }
+        }
+    }
     // TOOD: Instead of calling remove_replica unconditionally, propagate replica status for the client here
     // and only make remove_replica call if the client is actively replicating
     //
     // We cannot know whether there is atleast one replica listening for commands since this
     // information is only known by replication sub-system, hence propagate all commands
     if let ReplicaInfo::Master(_) = server.metadata.replica_info {
-        handle_client_disconnect(&conn.stream, server.deref());
+        server.handle_disconnect(&conn);
     }
     Ok(())
 }
@@ -274,7 +273,7 @@ fn serve_clients(server: Arc<Server>) -> anyhow::Result<()> {
                 );
                 let conn = Connection::new(stream);
                 let server = server.clone();
-                std::thread::spawn(|| handle_connection(conn, server).unwrap());
+                std::thread::spawn(|| handle_connection(conn, server));
             }
             Err(error) => {
                 eprintln!(

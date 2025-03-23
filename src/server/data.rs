@@ -3,7 +3,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{replication::replica_manager::ReplicaManager, storage::expiring_map::ExpiringHashMap};
+use crate::{
+    network::connection::Connection,
+    replication::replica_manager::ReplicaManager,
+    storage::expiring_map::ExpiringHashMap,
+};
 
 use super::metadata::{ReplicaInfo, ServerMetadata};
 
@@ -59,5 +63,10 @@ impl Server {
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.store.lock().unwrap().get(key)
+    }
+
+    pub fn handle_disconnect(&self, conn: &Connection) {
+        let mut replica_manager = self.replica_manager.lock().unwrap();
+        replica_manager.remove_replica(conn);
     }
 }

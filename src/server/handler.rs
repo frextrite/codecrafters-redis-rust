@@ -12,12 +12,12 @@ use super::data::Server;
 
 pub struct CommandHandler {
     stream: TcpStream,
-    state: Arc<Server>,
+    server: Arc<Server>,
 }
 
 impl CommandHandler {
-    pub fn new(stream: TcpStream, state: Arc<Server>) -> Self {
-        CommandHandler { stream, state }
+    pub fn new(stream: TcpStream, server: Arc<Server>) -> Self {
+        CommandHandler { stream, server }
     }
 
     pub fn handle_command(&mut self, command: &Command) -> std::io::Result<()> {
@@ -38,13 +38,13 @@ impl CommandHandler {
 
     fn handle_ping(&mut self) -> std::io::Result<()> {
         println!("DEBUG: received PING command");
-        match &self.state.metadata.replica_info {
+        match &self.server.metadata.replica_info {
             ReplicaInfo::Master(_) => {
                 let response = Token::SimpleString("PONG".to_string());
                 self.write_response(response)?;
             }
             ReplicaInfo::Slave(_) => {
-                if let LiveData::Slave(data) = &mut *self.state.live_data.lock().unwrap() {
+                if let LiveData::Slave(data) = &mut *self.server.live_data.lock().unwrap() {
                     data.heartbeat_recv_time = Some(Instant::now());
                 }
             }
@@ -63,7 +63,7 @@ impl CommandHandler {
         println!("DEBUG: received GET command with key {:?}", key);
         let response;
         {
-            let store = self.state.store.lock().unwrap();
+            let store = self.server.store.lock().unwrap();
             let value = store.get(key);
             response = match value {
                 Some(value) => Token::BulkString(value.to_vec()),
@@ -84,10 +84,10 @@ impl CommandHandler {
             "DEBUG: received SET command with key {:?} value {:?} expiry {:?}",
             key, value, expiry
         );
-        self.state.set(key, value, expiry);
+        self.server.set(key, value, expiry);
         // TODO: Only send reply if we are master, and not if we are a replica receiving
         // replicated commands and make this generic instead of adding if conditions
-        if let ReplicaInfo::Master(_) = self.state.metadata.replica_info {
+        if let ReplicaInfo::Master(_) = self.server.metadata.replica_info {
             let cmd = Command::Set {
                 key: key.to_vec(),
                 value: value.to_vec(),
@@ -96,9 +96,9 @@ impl CommandHandler {
             let token = cmd.to_resp_token();
             let repl_data = token.serialize();
 
-            self.state.propagate_message(repl_data.as_slice());
+            self.server.propagate_message(repl_data.as_slice());
 
-            if let LiveData::Master(data) = &mut *self.state.live_data.lock().unwrap() {
+            if let LiveData::Master(data) = &mut *self.server.live_data.lock().unwrap() {
                 data.replication_offset += repl_data.len();
             }
 
@@ -112,7 +112,7 @@ impl CommandHandler {
         println!("DEBUG: received INFO command with section {:?}", section);
         match section.as_slice() {
             b"replication" => {
-                self.write_response(Token::BulkString(self.state.metadata.get_replica_info()))?
+                self.write_response(Token::BulkString(self.server.metadata.get_replica_info()))?
             }
             _ => panic!("Not expecting to handle section {:?}", section),
         }
@@ -121,11 +121,11 @@ impl CommandHandler {
 
     fn handle_replconf(&mut self, replconf_command: &ReplConfCommand) -> std::io::Result<()> {
         println!("DEBUG: received REPLCONF command {:?}", replconf_command);
-        match self.state.metadata.replica_info {
+        match self.server.metadata.replica_info {
             ReplicaInfo::Master(_) => match replconf_command {
                 ReplConfCommand::Ack(offset) => {
                     println!("DEBUG: received ACK from replica");
-                    self.state.update_replica_offset(&self.stream, *offset);
+                    self.server.update_replica_offset(&self.stream, *offset);
                 }
                 ReplConfCommand::ListeningPort(_) | ReplConfCommand::Capa(_) => {
                     println!("DEBUG: sending OK response to REPLCONF");
@@ -138,7 +138,7 @@ impl CommandHandler {
             },
             ReplicaInfo::Slave(_) => {
                 // Send REPLCONF ACK as a response to REPLCONF GETACK
-                let offset = if let LiveData::Slave(data) = &*self.state.live_data.lock().unwrap() {
+                let offset = if let LiveData::Slave(data) = &*self.server.live_data.lock().unwrap() {
                     data.offset
                 } else {
                     panic!("Not expecting to handle REPLCONF command at master");
@@ -152,10 +152,10 @@ impl CommandHandler {
 
     fn handle_psync(&mut self) -> std::io::Result<()> {
         println!("DEBUG: received PSYNC command");
-        match &self.state.metadata.replica_info {
+        match &self.server.metadata.replica_info {
             ReplicaInfo::Master(info) => {
                 // 1. Send the FULLRESYNC response to the replica
-                let replication_offset = match &*self.state.live_data.lock().unwrap() {
+                let replication_offset = match &*self.server.live_data.lock().unwrap() {
                     LiveData::Master(data) => data.replication_offset,
                     LiveData::Slave(_) => panic!("Not expecting to handle PSYNC at slave"),
                 };
@@ -167,7 +167,7 @@ impl CommandHandler {
                 self.stream.write_all(rdb_payload.as_slice())?;
 
                 // 3. Register the replica
-                self.state.add_replica(self.stream.try_clone()?); // TODO: refactor this to use register_replica and handle errors
+                self.server.add_replica(self.stream.try_clone()?); // TODO: refactor this to use register_replica and handle errors
             }
             ReplicaInfo::Slave(_) => panic!("Not expecting to handle PSYNC at slave"),
         };
@@ -179,15 +179,15 @@ impl CommandHandler {
             "DEBUG: received WAIT command with replica_count {:?} and timeout {:?}",
             replica_count, timeout
         );
-        match &self.state.metadata.replica_info {
+        match &self.server.metadata.replica_info {
             ReplicaInfo::Master(_) => {
                 if replica_count == 0 {
                     self.write_response(Token::Integer(0))?;
                 }
 
-                if let ReplicaInfo::Master(..) = self.state.metadata.replica_info {
+                if let ReplicaInfo::Master(..) = self.server.metadata.replica_info {
                     // record the replication offset at the time of receiving the WAIT command
-                    let master_offset = match &*self.state.live_data.lock().unwrap() {
+                    let master_offset = match &*self.server.live_data.lock().unwrap() {
                         LiveData::Master(data) => data.replication_offset,
                         _ => panic!("Expected master data in live_data"),
                     };
@@ -195,11 +195,11 @@ impl CommandHandler {
                     // Send REPLCONF GETACK to all replicas
                     println!(
                         "DEBUG: sending GETACK to {} replicas",
-                        self.state.get_replica_count()
+                        self.server.get_replica_count()
                     );
                     let ack_cmd =
                         Command::ReplConf(ReplConfCommand::GetAck("*".to_string())).to_resp_token();
-                    self.state.propagate_message(ack_cmd.serialize().as_slice());
+                    self.server.propagate_message(ack_cmd.serialize().as_slice());
 
                     // Synchronously wait for replica_count replicas to acknowledge the offset
                     println!(
@@ -208,7 +208,7 @@ impl CommandHandler {
                     );
                     std::thread::sleep(timeout);
 
-                    let count_replicated = self.state.get_up_to_date_replicas_count(master_offset);
+                    let count_replicated = self.server.get_up_to_date_replicas_count(master_offset);
 
                     println!(
                         "DEBUG: {} replicas have replicated till the offset {}",

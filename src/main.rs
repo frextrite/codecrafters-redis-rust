@@ -1,92 +1,21 @@
-use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use std::{str, thread};
+use std::str;
+use std::sync::Arc;
+use std::time::Duration;
 
-use clap::Parser;
 use redis_starter_rust::common::CRLF;
 use redis_starter_rust::network::connection::{Connection, ConnectionError, ConnectionResult};
-use redis_starter_rust::parser::command::{parse_command, Command, ReplConfCommand};
+use redis_starter_rust::parser::command::parse_command;
 use redis_starter_rust::parser::rdb::parse_rdb_payload;
 use redis_starter_rust::parser::resp::Token;
 use redis_starter_rust::parser::resp::{parse_buffer, ParseError};
-use redis_starter_rust::replication::rdb::{get_empty_rdb, serialize_rdb};
-use redis_starter_rust::replication::replica_manager::{Replica, ReplicaManager};
 use redis_starter_rust::server::config::Config;
-use redis_starter_rust::server::metadata::{self, ReplicaInfo, ServerMetadata};
-use redis_starter_rust::storage::expiring_map::ExpiringHashMap;
+use redis_starter_rust::server::handler::CommandHandler;
+use redis_starter_rust::server::metadata::{ReplicaInfo, ServerMetadata};
+use redis_starter_rust::server::state::{LiveData, State};
 
 const HOST: &str = "127.0.0.1";
-#[allow(dead_code)]
-const CR: u8 = b'\r';
-#[allow(dead_code)]
-const LF: u8 = b'\n';
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Cli {
-    #[arg(short, long, default_value_t = 6379)]
-    port: u16,
-    #[arg(short, long)]
-    replicaof: Option<String>,
-}
-
-struct MasterLiveData {
-    replication_offset: usize,
-}
-
-struct SlaveLiveData {
-    offset: usize,
-    heartbeat_recv_time: Option<Instant>,
-}
-
-enum LiveData {
-    Master(MasterLiveData),
-    Slave(SlaveLiveData),
-}
-
-impl LiveData {
-    fn new(info: &ReplicaInfo) -> LiveData {
-        match info {
-            ReplicaInfo::Master(..) => LiveData::Master(MasterLiveData {
-                replication_offset: 0,
-            }),
-            ReplicaInfo::Slave(..) => LiveData::Slave(SlaveLiveData {
-                offset: 0,
-                heartbeat_recv_time: None,
-            }),
-        }
-    }
-}
-
-struct State {
-    metadata: ServerMetadata,
-    replica_manager: Mutex<ReplicaManager>,
-    live_data: Mutex<LiveData>,
-    store: Mutex<ExpiringHashMap>,
-}
-
-impl State {
-    fn new(metadata: ServerMetadata) -> State {
-        let live_data = Mutex::new(LiveData::new(&metadata.replica_info));
-        State {
-            metadata,
-            replica_manager: Mutex::new(ReplicaManager::new()),
-            live_data,
-            store: Mutex::new(ExpiringHashMap::new()),
-        }
-    }
-
-    fn set(&self, key: &[u8], value: &[u8], expiry: Option<Duration>) {
-        self.store.lock().unwrap().set(key, value, expiry);
-    }
-
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.store.lock().unwrap().get(key)
-    }
-}
 
 // TODO: avoid extra copies
 fn serialize_to_array(data: &[&[u8]]) -> Vec<u8> {
@@ -107,188 +36,6 @@ fn serialize_to_bulkstring(data: Option<&[u8]>) -> Vec<u8> {
     }
 }
 
-fn serialize_to_simplestring(data: &[u8]) -> Vec<u8> {
-    format!("+{}{CRLF}", std::str::from_utf8(data).unwrap()).into_bytes()
-}
-
-fn serialize_to_integer(value: usize) -> Vec<u8> {
-    format!(":{}{CRLF}", value).into_bytes()
-}
-
-fn handle_command(
-    command: &Command,
-    stream: &mut TcpStream,
-    state: Arc<State>,
-) -> std::io::Result<()> {
-    match command {
-        Command::Ping => {
-            if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-                stream.write_all(&serialize_to_simplestring(b"PONG"))?
-            } else if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref_mut() {
-                data.heartbeat_recv_time = Some(Instant::now());
-            }
-        }
-        Command::Echo(data) => stream.write_all(&serialize_to_bulkstring(Some(data)))?,
-        Command::Get(key) => {
-            let value = state.get(key).map(|v| v.to_vec());
-            stream.write_all(&serialize_to_bulkstring(value.as_deref()))?
-        }
-        Command::Set { key, value, expiry } => {
-            state.set(key, value, *expiry);
-            println!(
-                "DEBUG: setting key {:?} value {:?} with expiry {:?}",
-                std::str::from_utf8(key),
-                std::str::from_utf8(value),
-                expiry
-            );
-            // TODO: Only send reply if we are master, and not if we are a replica receiving
-            // replicated commands and make this generic instead of adding if conditions
-            if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-                stream.write_all(&serialize_to_simplestring(b"OK"))?
-            }
-        }
-        Command::Info(section) => match std::str::from_utf8(section).unwrap() {
-            "replication" => stream.write_all(&serialize_to_bulkstring(Some(
-                &state.metadata.get_replica_info(),
-            )))?,
-            _ => panic!("Not expecting to receive section other than replication"),
-        },
-        Command::ReplConf(replconf_command) => {
-            println!("DEBUG: received REPLCONF command {:?}", replconf_command);
-            // TODO: Handle REPLCONF command validation before sending responses
-            if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-                match replconf_command {
-                    ReplConfCommand::Ack(offset) => {
-                        println!("DEBUG: received ACK from replica");
-                        state
-                            .replica_manager
-                            .lock()
-                            .unwrap()
-                            .update_replica_offset(stream, *offset);
-                    }
-                    ReplConfCommand::ListeningPort(_) | ReplConfCommand::Capa(_) => {
-                        println!("DEBUG: sending OK response to REPLCONF");
-                        stream.write_all(&serialize_to_simplestring(b"OK"))?
-                    }
-                    _ => {}
-                }
-            } else if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref() {
-                // Send REPLCONF ACK as a response to REPLCONF GETACK
-                stream.write_all(&serialize_to_array(&[
-                    &serialize_to_bulkstring(Some(b"REPLCONF")),
-                    &serialize_to_bulkstring(Some(b"ACK")),
-                    &serialize_to_bulkstring(Some(data.offset.to_string().as_bytes())),
-                ]))?
-            }
-        }
-        Command::Psync => {
-            if let ReplicaInfo::Master(info) = &state.metadata.replica_info {
-                // TODO: Merge this with replica info in state
-                let replication_offset = match state.live_data.lock().unwrap().deref() {
-                    LiveData::Master(data) => data.replication_offset,
-                    _ => panic!("Expected master data in live_data"),
-                };
-                let payload = format!("FULLRESYNC {} {}", info.replication_id, replication_offset);
-                stream.write_all(&serialize_to_simplestring(payload.as_bytes()))?;
-                let rdb_payload = serialize_rdb(&get_empty_rdb());
-                println!("DEBUG: sending RDB payload (as hex): {:x?}", &rdb_payload);
-                stream.write_all(&rdb_payload)?;
-
-                let replica = Replica::new(stream.try_clone().unwrap());
-                state.replica_manager.lock().unwrap().add_replica(replica);
-            } else {
-                panic!("PSYNC not supported on slave")
-            }
-        }
-        Command::Wait {
-            replica_count,
-            timeout,
-        } => {
-            println!(
-                "DEBUG: received WAIT command with replica_count {:?} and timeout {:?}",
-                replica_count, timeout
-            );
-
-            if replica_count == &0 {
-                stream.write_all(&serialize_to_integer(0))?;
-            } else if let ReplicaInfo::Master(..) = state.metadata.replica_info {
-                // record the replication offset at the time of receiving the WAIT command
-                let master_offset = match state.live_data.lock().unwrap().deref() {
-                    LiveData::Master(data) => data.replication_offset,
-                    _ => panic!("Expected master data in live_data"),
-                };
-
-                // Send REPLCONF GETACK to all replicas
-                println!(
-                    "DEBUG: sending GETACK to {} replicas",
-                    state
-                        .replica_manager
-                        .lock()
-                        .unwrap()
-                        .get_connected_replica_count()
-                );
-                state
-                    .replica_manager
-                    .lock()
-                    .unwrap()
-                    .propagate_message_to_replicas(&serialize_to_array(&[
-                        &serialize_to_bulkstring(Some(b"REPLCONF")),
-                        &serialize_to_bulkstring(Some(b"GETACK")),
-                        &serialize_to_bulkstring(Some(b"*")),
-                    ]));
-
-                // Synchronously wait for replica_count replicas to acknowledge the offset
-                println!(
-                    "DEBUG: sleeping for {:?} before getting replication status",
-                    timeout
-                );
-                thread::sleep(*timeout);
-
-                let count_replicated = state
-                    .replica_manager
-                    .lock()
-                    .unwrap()
-                    .get_up_to_date_replicas_count(master_offset);
-
-                println!(
-                    "DEBUG: {} replicas have replicated till the offset {}",
-                    count_replicated, master_offset
-                );
-
-                let response = serialize_to_integer(count_replicated);
-                println!(
-                    "DEBUG: sending WAIT response {:?}",
-                    std::str::from_utf8(&response).unwrap()
-                );
-                stream.write_all(&response)?;
-            }
-        }
-    };
-    Ok(())
-}
-
-fn can_replicate_command(command: &Command) -> bool {
-    matches!(command, Command::Set { .. })
-}
-
-fn handle_command_replication(command: &Command, message: &[u8], state: &State) {
-    if can_replicate_command(command) {
-        println!(
-            "DEBUG: replicating command {:?} with contents {:?}",
-            command, message
-        );
-        state
-            .replica_manager
-            .lock()
-            .unwrap()
-            .propagate_message_to_replicas(message);
-        // update master replication offset
-        if let LiveData::Master(data) = state.live_data.lock().unwrap().deref_mut() {
-            data.replication_offset += message.len();
-        }
-    }
-}
-
 fn handle_client_disconnect(stream: &TcpStream, state: &State) {
     if state
         .replica_manager
@@ -305,14 +52,16 @@ fn handle_client_disconnect(stream: &TcpStream, state: &State) {
 }
 
 fn handle_connection(mut conn: Connection, state: Arc<State>) -> std::io::Result<()> {
+    let mut handler = CommandHandler::new(conn.stream.try_clone()?, state.clone());
+
     loop {
         match parse_command(conn.get_buffer()) {
             Ok(result) => {
                 let command = result.command;
-                handle_command(&command, &mut conn.stream, state.clone())?;
-                if let ReplicaInfo::Master(_) = state.metadata.replica_info {
-                    handle_command_replication(&command, conn.get_buffer(), state.deref());
-                } else if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref_mut() {
+
+                handler.handle_command(&command)?;
+
+                if let LiveData::Slave(data) = state.live_data.lock().unwrap().deref_mut() {
                     data.offset += result.len;
                 }
                 conn.consume(result.len);

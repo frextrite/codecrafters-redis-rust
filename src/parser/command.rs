@@ -33,6 +33,43 @@ pub enum Command {
     },
 }
 
+impl Command {
+    pub fn to_resp_token(&self) -> Token {
+        match self {
+            Command::Set { key, value, expiry } => {
+                let mut tokens = vec![
+                    Token::BulkString(b"set".to_vec()),
+                    Token::BulkString(key.to_vec()),
+                    Token::BulkString(value.to_vec()),
+                ];
+                if let Some(expiry) = *expiry {
+                    tokens.push(Token::BulkString(b"px".to_vec()));
+                    tokens.push(Token::BulkString(
+                        expiry.as_millis().to_string().as_bytes().to_vec(),
+                    ));
+                }
+                Token::Array(tokens)
+            }
+            Command::ReplConf(replconf_cmd) => {
+                let mut tokens = vec![Token::BulkString(b"REPLCONF".to_vec())];
+                match replconf_cmd {
+                    ReplConfCommand::Ack(offset) => {
+                        tokens.push(Token::BulkString(b"ACK".to_vec()));
+                        tokens.push(Token::BulkString(offset.to_string().as_bytes().to_vec()));
+                    }
+                    ReplConfCommand::GetAck(offset) => {
+                        tokens.push(Token::BulkString(b"GETACK".to_vec()));
+                        tokens.push(Token::BulkString(offset.as_bytes().to_vec()));
+                    }
+                    _ => unimplemented!(),
+                }
+                Token::Array(tokens)
+            }
+            _ => unimplemented!(),
+        }
+    }
+}
+
 pub struct CommandResult {
     pub command: Command,
     pub len: usize,

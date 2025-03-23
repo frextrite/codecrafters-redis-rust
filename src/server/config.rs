@@ -9,6 +9,12 @@ pub struct Config {
     replicaof: Option<String>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Config::new()
+    }
+}
+
 impl Config {
     pub fn new() -> Self {
         Config::parse()

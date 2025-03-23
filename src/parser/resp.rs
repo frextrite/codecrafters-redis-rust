@@ -8,8 +8,10 @@ pub type Result<T> = std::result::Result<T, ParseError>;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Token {
+    Array(Vec<Token>),
     SimpleString(String),
     BulkString(Vec<u8>),
+    Integer(i64),
 }
 
 impl Token {
@@ -26,6 +28,55 @@ impl Token {
             Ok(data)
         } else {
             Err(ParseError::Invalid)
+        }
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        const CRLF: &[u8] = b"\r\n";
+        match self {
+            Token::Array(tokens) => {
+                let mut result = Vec::new();
+                result.push(b'*');
+                result.extend(tokens.len().to_string().as_bytes());
+                result.extend(CRLF);
+                for token in tokens {
+                    result.extend(token.serialize());
+                }
+                result
+            }
+            Token::SimpleString(data) => {
+                let mut result = Vec::new();
+                result.push(b'+');
+                result.extend(data.as_bytes());
+                result.extend(CRLF);
+                result
+            }
+            Token::BulkString(data) => {
+                let mut result = Vec::new();
+                result.push(b'$');
+
+                if data.is_empty() {
+                    result.extend(b"-1");
+                } else {
+                    result.extend(data.len().to_string().as_bytes());
+                }
+
+                result.extend(CRLF);
+
+                if !data.is_empty() {
+                    result.extend(data);
+                    result.extend(CRLF);
+                }
+
+                result
+            }
+            Token::Integer(value) => {
+                let mut result = Vec::new();
+                result.push(b':');
+                result.extend(value.to_string().as_bytes());
+                result.extend(CRLF);
+                result
+            }
         }
     }
 }

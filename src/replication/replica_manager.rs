@@ -9,14 +9,14 @@ use crate::network::connection::Connection;
 pub type ReplicaId = usize;
 
 pub struct Replica {
-    pub conn: Connection,
+    pub stream: TcpStream,
     replica_offset: usize,
 }
 
 impl Replica {
     pub fn new(stream: TcpStream) -> Self {
         Self {
-            conn: Connection::new(stream),
+            stream,
             replica_offset: 0,
         }
     }
@@ -34,9 +34,13 @@ impl ReplicaManager {
         }
     }
 
+    pub fn new_replica(stream: TcpStream) -> Replica {
+        Replica::new(stream)
+    }
+
     pub fn add_replica(&mut self, replica: Replica) -> Option<Replica> {
         self.replicas
-            .insert(replica.conn.stream.peer_addr().unwrap(), replica)
+            .insert(replica.stream.peer_addr().unwrap(), replica)
     }
 
     pub fn remove_replica(&mut self, conn: &Connection) -> Option<Replica> {
@@ -49,7 +53,7 @@ impl ReplicaManager {
 
     pub fn propagate_message_to_replicas(&mut self, message: &[u8]) {
         for (_, replica) in self.replicas.iter_mut() {
-            let _ = replica.conn.stream.write_all(message);
+            let _ = replica.stream.write_all(message);
         }
     }
 

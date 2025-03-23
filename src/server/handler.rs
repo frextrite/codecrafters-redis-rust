@@ -5,7 +5,6 @@ use std::{net::TcpStream, sync::Arc};
 use crate::parser::command::ReplConfCommand;
 use crate::parser::resp::Token;
 use crate::replication::rdb::{get_empty_rdb, serialize_rdb};
-use crate::replication::replica_manager::Replica;
 use crate::server::data::LiveData;
 use crate::{parser::command::Command, server::metadata::ReplicaInfo};
 
@@ -97,11 +96,7 @@ impl CommandHandler {
             let token = cmd.to_resp_token();
             let repl_data = token.serialize();
 
-            self.state
-                .replica_manager
-                .lock()
-                .unwrap()
-                .propagate_message_to_replicas(repl_data.as_slice());
+            self.state.propagate_message(repl_data.as_slice());
 
             if let LiveData::Master(data) = &mut *self.state.live_data.lock().unwrap() {
                 data.replication_offset += repl_data.len();
@@ -130,11 +125,7 @@ impl CommandHandler {
             ReplicaInfo::Master(_) => match replconf_command {
                 ReplConfCommand::Ack(offset) => {
                     println!("DEBUG: received ACK from replica");
-                    self.state
-                        .replica_manager
-                        .lock()
-                        .unwrap()
-                        .update_replica_offset(&self.stream, *offset);
+                    self.state.update_replica_offset(&self.stream, *offset);
                 }
                 ReplConfCommand::ListeningPort(_) | ReplConfCommand::Capa(_) => {
                     println!("DEBUG: sending OK response to REPLCONF");
@@ -176,12 +167,7 @@ impl CommandHandler {
                 self.stream.write_all(rdb_payload.as_slice())?;
 
                 // 3. Register the replica
-                let replica = Replica::new(self.stream.try_clone()?);
-                self.state
-                    .replica_manager
-                    .lock()
-                    .unwrap()
-                    .add_replica(replica); // TODO: refactor this to use register_replica and handle errors
+                self.state.add_replica(self.stream.try_clone()?); // TODO: refactor this to use register_replica and handle errors
             }
             ReplicaInfo::Slave(_) => panic!("Not expecting to handle PSYNC at slave"),
         };
@@ -209,19 +195,11 @@ impl CommandHandler {
                     // Send REPLCONF GETACK to all replicas
                     println!(
                         "DEBUG: sending GETACK to {} replicas",
-                        self.state
-                            .replica_manager
-                            .lock()
-                            .unwrap()
-                            .get_connected_replica_count()
+                        self.state.get_replica_count()
                     );
                     let ack_cmd =
                         Command::ReplConf(ReplConfCommand::GetAck("*".to_string())).to_resp_token();
-                    self.state
-                        .replica_manager
-                        .lock()
-                        .unwrap()
-                        .propagate_message_to_replicas(ack_cmd.serialize().as_slice());
+                    self.state.propagate_message(ack_cmd.serialize().as_slice());
 
                     // Synchronously wait for replica_count replicas to acknowledge the offset
                     println!(
@@ -230,12 +208,7 @@ impl CommandHandler {
                     );
                     std::thread::sleep(timeout);
 
-                    let count_replicated = self
-                        .state
-                        .replica_manager
-                        .lock()
-                        .unwrap()
-                        .get_up_to_date_replicas_count(master_offset);
+                    let count_replicated = self.state.get_up_to_date_replicas_count(master_offset);
 
                     println!(
                         "DEBUG: {} replicas have replicated till the offset {}",

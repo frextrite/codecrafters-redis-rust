@@ -1,39 +1,17 @@
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::str;
 use std::sync::Arc;
-use std::time::Duration;
 
-use codecrafters_redis::common::CRLF;
-use codecrafters_redis::network::connection::{Connection, ConnectionError, ConnectionResult};
+use codecrafters_redis::network::connection::Connection;
 use codecrafters_redis::parser::command::parse_command;
-use codecrafters_redis::parser::rdb::parse_rdb_payload;
-use codecrafters_redis::parser::resp::Token;
-use codecrafters_redis::parser::resp::{parse_buffer, ParseError};
+use codecrafters_redis::parser::resp::ParseError;
+use codecrafters_redis::replication::handshake::{self, Handshaker};
 use codecrafters_redis::server::config::Config;
 use codecrafters_redis::server::data::{LiveData, Server};
 use codecrafters_redis::server::handler::CommandHandler;
 use codecrafters_redis::server::metadata::{ReplicaInfo, ServerMetadata};
 
 const HOST: &str = "127.0.0.1";
-
-// TODO: avoid extra copies
-fn serialize_to_array(data: &[&[u8]]) -> Vec<u8> {
-    let count = data.len();
-    let data = data.iter().flat_map(|&x| x).copied().collect::<Vec<u8>>();
-    format!("*{}{CRLF}{}", count, std::str::from_utf8(&data).unwrap()).into_bytes()
-}
-
-fn serialize_to_bulkstring(data: Option<&[u8]>) -> Vec<u8> {
-    match data {
-        Some(bytes) => format!(
-            "${}{CRLF}{}{CRLF}",
-            bytes.len(),
-            std::str::from_utf8(bytes).unwrap()
-        )
-        .into_bytes(),
-        None => format!("$-1{CRLF}").into_bytes(),
-    }
-}
 
 fn handle_read_loop(conn: &mut Connection, server: Arc<Server>) -> std::io::Result<()> {
     let mut handler = CommandHandler::new(conn.stream.try_clone()?, server.clone());
@@ -61,8 +39,8 @@ fn handle_read_loop(conn: &mut Connection, server: Arc<Server>) -> std::io::Resu
     }
 }
 
-fn handle_connection(mut conn: Connection, server: Arc<Server>) -> std::io::Result<()> {
-    match handle_read_loop(&mut conn, server.clone()) {
+fn handle_connection(conn: &mut Connection, server: Arc<Server>) -> std::io::Result<()> {
+    match handle_read_loop(conn, server.clone()) {
         Ok(_) => {
             println!("INFO: client disconnected");
         }
@@ -70,7 +48,7 @@ fn handle_connection(mut conn: Connection, server: Arc<Server>) -> std::io::Resu
             if err.kind() == std::io::ErrorKind::UnexpectedEof {
                 println!("INFO: client disconnected");
             } else {
-                eprintln!("ERROR: failed to handle connection with error {:?}", err);
+                eprintln!("ERROR: failed to handle connection with error {:?}", &err);
             }
         }
     }
@@ -80,179 +58,42 @@ fn handle_connection(mut conn: Connection, server: Arc<Server>) -> std::io::Resu
     // We cannot know whether there is atleast one replica listening for commands since this
     // information is only known by replication sub-system, hence propagate all commands
     if let ReplicaInfo::Master(_) = server.metadata.replica_info {
-        server.handle_disconnect(&conn);
+        server.handle_disconnect(conn);
     }
     Ok(())
 }
 
-fn send_req(req: &[u8], conn: &mut Connection, command: &str) -> std::io::Result<()> {
-    println!(
-        "INFO: sending {} request {:?}",
-        command,
-        std::str::from_utf8(req).unwrap()
-    );
-    conn.write_message(req)?;
-    Ok(())
-}
-
-// Validates FULLRESYNC response that is received, as well as the
-// RDB payload response. This does not propagate the payload to the caller
-// and panics in case the message is not as expected.
-// Modify this to propagate information to the caller.
-fn parse_and_validate_psync_response(conn: &mut Connection) {
-    // Read and validate PSYNC response
-    let result = loop {
-        let message = conn.get_buffer();
-        match parse_buffer(message) {
-            Ok(result) => break result,
-            Err(ParseError::Incomplete) => {
-                conn.read_message().unwrap();
-            }
-            Err(err) => {
-                eprintln!("ERROR: failed to parse PSYNC response with error {:?}", err);
-                panic!("Failed to parse PSYNC response");
-            }
-        }
-    };
-
-    if result.tokens.len() != 1 {
-        panic!(
-            "Expected 1 token in PSYNC response but received {}",
-            result.tokens.len()
-        );
-    }
-
-    match result.tokens.first().unwrap() {
-        Token::SimpleString(data) => {
-            let data = std::str::from_utf8(data.as_bytes()).unwrap();
-            if data.starts_with("FULLRESYNC") {
-                println!("INFO: received FULLRESYNC from master: {:?}", data);
-            } else {
-                panic!("Expected FULLRESYNC but received {:?}", data);
-            }
-        }
-        _ => panic!(
-            "Expected SimpleString but received {:?}",
-            result.tokens.first().unwrap()
-        ),
-    }
-    conn.consume(result.len);
-
-    // Read and validate RDB payload
-    let rdb_payload = loop {
-        let message = conn.get_buffer();
-        match parse_rdb_payload(message) {
-            Ok(result) => break result,
-            Err(ParseError::Incomplete) => {
-                conn.read_message().unwrap();
-            }
-            Err(err) => {
-                eprintln!("ERROR: failed to parse RDB payload with error {:?}", err);
-                panic!("Failed to parse RDB payload");
-            }
-        }
-    };
-
-    println!(
-        "DEBUG: successfully parsed RDB payload with length {}",
-        rdb_payload.len
-    );
-    conn.consume(rdb_payload.len);
-}
-
-fn send_req_and_validate_simple_string_resp(
-    req: &[u8],
-    conn: &mut Connection,
-    command: &str,
-    expected: &str,
-) -> ConnectionResult<()> {
-    // send the request
-    send_req(req, conn, command)?;
-
-    // read the response
-    let tokens = loop {
-        let message = conn.get_buffer();
-        match parse_buffer(message) {
-            Ok(result) => {
-                conn.consume(result.len);
-                break result.tokens;
-            }
-            Err(ParseError::Incomplete) => conn.read_message()?,
-            Err(err) => {
-                eprintln!(
-                    "ERROR: failed to parse response for command {} with error {:?}",
-                    command, err
-                );
-                return Err(ConnectionError::Parse(err));
-            }
-        }
-    };
-
-    println!(
-        "DEBUG: received response for command {}: {:?}",
-        command, tokens
-    );
-
-    if tokens.len() != 1 {
-        return Err(ConnectionError::Parse(ParseError::Invalid));
-    }
-
-    match &tokens[0] {
-        Token::SimpleString(resp) if resp.to_lowercase() == expected.to_lowercase() => (),
-        _ => return Err(ConnectionError::Parse(ParseError::Invalid)),
-    };
-
-    Ok(())
-}
-
-fn initiate_replication_as_slave(
+fn initiate_replication(
     host: String,
     port: u16,
     host_port: u16,
     server: Arc<Server>,
-) -> ConnectionResult<()> {
+) -> anyhow::Result<()> {
     println!("INFO: connecting to master at {}:{}", &host, port);
-    {
-        let stream = TcpStream::connect((host, port))?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut conn = Connection::new(stream.try_clone()?);
 
-        // Step 1: Send PING
-        // TODO: Use Vec instead of a slice since the array size cannot be known at compile time for generic arrays
-        let ping_req = serialize_to_array(&[&serialize_to_bulkstring(Some(b"PING"))]);
-        send_req_and_validate_simple_string_resp(&ping_req, &mut conn, "PING", "PONG")?;
+    let config = handshake::Config {
+        master_host: host.clone(),
+        master_port: port,
+        replica_port: host_port,
+    };
+    let handshaker = Handshaker::new(config);
 
-        // Step 2: Send REPLCONF messages
-        // Step 2.1: Send REPLCONF with listening-port information
-        let repl_conf_port_req = serialize_to_array(&[
-            &serialize_to_bulkstring(Some(b"REPLCONF")),
-            &serialize_to_bulkstring(Some(b"listening-port")),
-            &serialize_to_bulkstring(Some(host_port.to_string().as_bytes())),
-        ]);
-        send_req_and_validate_simple_string_resp(&repl_conf_port_req, &mut conn, "REPLCONF", "OK")?;
+    let mut payload = match handshaker.perform_handshake() {
+        Ok(payload) => {
+            println!("INFO: successfully performed handshake with master");
+            payload
+        }
+        Err(err) => {
+            eprintln!("ERROR: failed to perform handshake with master: {:?}", &err);
+            return Err(anyhow::anyhow!(
+                "Failed to perform handshake with master: {:?}",
+                &err
+            ));
+        }
+    };
 
-        // Step 2.2: Send REPLCONF with capabilities information
-        let repl_conf_capa_req = serialize_to_array(&[
-            &serialize_to_bulkstring(Some(b"REPLCONF")),
-            &serialize_to_bulkstring(Some(b"capa")),
-            &serialize_to_bulkstring(Some(b"psync2")),
-        ]);
-        send_req_and_validate_simple_string_resp(&repl_conf_capa_req, &mut conn, "REPLCONF", "OK")?;
+    handle_connection(payload.client.get_connection(), server)?;
 
-        // Step 3: Send PSYNC message
-        let psync_req = serialize_to_array(&[
-            &serialize_to_bulkstring(Some(b"PSYNC")),
-            &serialize_to_bulkstring(Some(b"?")),
-            &serialize_to_bulkstring(Some(b"-1")),
-        ]);
-        send_req(&psync_req, &mut conn, "PSYNC")?;
-        parse_and_validate_psync_response(&mut conn);
-
-        println!("INFO: successfully initiated replication for slave");
-
-        // Start replication
-        handle_connection(conn, server)?;
-    }
     Ok(())
 }
 
@@ -271,14 +112,14 @@ fn serve_clients(server: Arc<Server>) -> anyhow::Result<()> {
                     "INFO: accepted incoming connection from {:?}",
                     stream.peer_addr()
                 );
-                let conn = Connection::new(stream);
+                let mut conn = Connection::new(stream);
                 let server = server.clone();
-                std::thread::spawn(|| handle_connection(conn, server));
+                std::thread::spawn(move || handle_connection(&mut conn, server));
             }
             Err(error) => {
                 eprintln!(
                     "ERROR: failed to accept an incoming connection with error {:?}",
-                    error
+                    &error
                 );
             }
         }
@@ -289,7 +130,7 @@ fn serve_clients(server: Arc<Server>) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let config = Config::new();
-    println!("DEBUG: parsed cli args: {:?}", config);
+    println!("DEBUG: parsed cli args: {:?}", &config);
 
     let metadata = ServerMetadata::generate(&config);
     let server = Arc::new(Server::new(metadata));
@@ -302,14 +143,14 @@ fn main() -> anyhow::Result<()> {
         let master_port = info.master_port;
         let server = server.clone();
         std::thread::spawn(move || {
-            let result = initiate_replication_as_slave(
+            let result = initiate_replication(
                 master_host,
                 master_port,
                 server.metadata.listening_port,
                 server,
             );
             if let Err(err) = result {
-                eprintln!("ERROR: replication failed with error {:?}", err);
+                eprintln!("ERROR: replication failed with error {:?}", &err);
             }
         });
     }

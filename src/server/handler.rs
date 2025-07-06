@@ -53,14 +53,14 @@ impl CommandHandler {
     }
 
     fn handle_echo(&mut self, data: &[u8]) -> std::io::Result<()> {
-        println!("DEBUG: received ECHO command with data {:?}", data);
+        println!("DEBUG: received ECHO command with data {data:?}");
         let response = Token::BulkString(data.to_vec());
         self.write_response(response)?;
         Ok(())
     }
 
     fn handle_get(&mut self, key: &[u8]) -> std::io::Result<()> {
-        println!("DEBUG: received GET command with key {:?}", key);
+        println!("DEBUG: received GET command with key {key:?}");
         let response;
         {
             let store = self.server.store.lock().unwrap();
@@ -80,10 +80,7 @@ impl CommandHandler {
         value: &[u8],
         expiry: Option<Duration>,
     ) -> std::io::Result<()> {
-        println!(
-            "DEBUG: received SET command with key {:?} value {:?} expiry {:?}",
-            key, value, expiry
-        );
+        println!("DEBUG: received SET command with key {key:?} value {value:?} expiry {expiry:?}");
         self.server.set(key, value, expiry);
         // TODO: Only send reply if we are master, and not if we are a replica receiving
         // replicated commands and make this generic instead of adding if conditions
@@ -109,18 +106,18 @@ impl CommandHandler {
     }
 
     fn handle_info(&mut self, section: &Vec<u8>) -> std::io::Result<()> {
-        println!("DEBUG: received INFO command with section {:?}", section);
+        println!("DEBUG: received INFO command with section {section:?}");
         match section.as_slice() {
             b"replication" => {
                 self.write_response(Token::BulkString(self.server.metadata.get_replica_info()))?
             }
-            _ => panic!("Not expecting to handle section {:?}", section),
+            _ => panic!("Not expecting to handle section {section:?}"),
         }
         Ok(())
     }
 
     fn handle_replconf(&mut self, replconf_command: &ReplConfCommand) -> std::io::Result<()> {
-        println!("DEBUG: received REPLCONF command {:?}", replconf_command);
+        println!("DEBUG: received REPLCONF command {replconf_command:?}");
         match self.server.metadata.replica_info {
             ReplicaInfo::Master(_) => match replconf_command {
                 ReplConfCommand::Ack(offset) => {
@@ -132,13 +129,13 @@ impl CommandHandler {
                     self.write_response(Token::SimpleString("OK".to_string()))?;
                 }
                 _ => panic!(
-                    "Not expecting to handle REPLCONF command {:?} at master",
-                    replconf_command
+                    "Not expecting to handle REPLCONF command {replconf_command:?} at master"
                 ),
             },
             ReplicaInfo::Slave(_) => {
                 // Send REPLCONF ACK as a response to REPLCONF GETACK
-                let offset = if let LiveData::Slave(data) = &*self.server.live_data.lock().unwrap() {
+                let offset = if let LiveData::Slave(data) = &*self.server.live_data.lock().unwrap()
+                {
                     data.offset
                 } else {
                     panic!("Not expecting to handle REPLCONF command at master");
@@ -176,8 +173,7 @@ impl CommandHandler {
 
     fn handle_wait(&mut self, replica_count: usize, timeout: Duration) -> std::io::Result<()> {
         println!(
-            "DEBUG: received WAIT command with replica_count {:?} and timeout {:?}",
-            replica_count, timeout
+            "DEBUG: received WAIT command with replica_count {replica_count:?} and timeout {timeout:?}"
         );
         match &self.server.metadata.replica_info {
             ReplicaInfo::Master(_) => {
@@ -199,24 +195,21 @@ impl CommandHandler {
                     );
                     let ack_cmd =
                         Command::ReplConf(ReplConfCommand::GetAck("*".to_string())).to_resp_token();
-                    self.server.propagate_message(ack_cmd.serialize().as_slice());
+                    self.server
+                        .propagate_message(ack_cmd.serialize().as_slice());
 
                     // Synchronously wait for replica_count replicas to acknowledge the offset
-                    println!(
-                        "DEBUG: sleeping for {:?} before getting replication status",
-                        timeout
-                    );
+                    println!("DEBUG: sleeping for {timeout:?} before getting replication status");
                     std::thread::sleep(timeout);
 
                     let count_replicated = self.server.get_up_to_date_replicas_count(master_offset);
 
                     println!(
-                        "DEBUG: {} replicas have replicated till the offset {}",
-                        count_replicated, master_offset
+                        "DEBUG: {count_replicated} replicas have replicated till the offset {master_offset}"
                     );
 
                     let response = Token::Integer(count_replicated as i64);
-                    println!("DEBUG: sending WAIT response {:?}", response);
+                    println!("DEBUG: sending WAIT response {response:?}");
                     self.write_response(response)?;
                 }
             }

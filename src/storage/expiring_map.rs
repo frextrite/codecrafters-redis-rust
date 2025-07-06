@@ -100,7 +100,7 @@ impl ExpiringHashMap {
             let num_expired_keys = Self::cleanup_expired_keys(store.clone());
 
             if num_expired_keys > 0 {
-                println!("INFO: cleaned up {} expired keys", num_expired_keys);
+                println!("INFO: cleaned up {num_expired_keys} expired keys");
             }
 
             let (gc_stop_requested, gc_stop_cv) = &*gc_stop;

@@ -3,16 +3,16 @@ use std::str;
 use std::sync::Arc;
 use std::time::Duration;
 
-use redis_starter_rust::common::CRLF;
-use redis_starter_rust::network::connection::{Connection, ConnectionError, ConnectionResult};
-use redis_starter_rust::parser::command::parse_command;
-use redis_starter_rust::parser::rdb::parse_rdb_payload;
-use redis_starter_rust::parser::resp::Token;
-use redis_starter_rust::parser::resp::{parse_buffer, ParseError};
-use redis_starter_rust::server::config::Config;
-use redis_starter_rust::server::data::{LiveData, Server};
-use redis_starter_rust::server::handler::CommandHandler;
-use redis_starter_rust::server::metadata::{ReplicaInfo, ServerMetadata};
+use codecrafters_redis::common::CRLF;
+use codecrafters_redis::network::connection::{Connection, ConnectionError, ConnectionResult};
+use codecrafters_redis::parser::command::parse_command;
+use codecrafters_redis::parser::rdb::parse_rdb_payload;
+use codecrafters_redis::parser::resp::Token;
+use codecrafters_redis::parser::resp::{parse_buffer, ParseError};
+use codecrafters_redis::server::config::Config;
+use codecrafters_redis::server::data::{LiveData, Server};
+use codecrafters_redis::server::handler::CommandHandler;
+use codecrafters_redis::server::metadata::{ReplicaInfo, ServerMetadata};
 
 const HOST: &str = "127.0.0.1";
 

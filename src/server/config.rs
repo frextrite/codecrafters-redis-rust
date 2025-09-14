@@ -7,6 +7,10 @@ pub struct Config {
     port: u16,
     #[arg(short, long)]
     replicaof: Option<String>,
+    #[arg(long)]
+    dir: Option<String>,
+    #[arg(long)]
+    dbfilename: Option<String>,
 }
 
 impl Default for Config {
@@ -43,5 +47,13 @@ impl Config {
 
     pub fn is_master(&self) -> bool {
         self.replicaof.is_none()
+    }
+
+    pub fn get_data_dir(&self) -> Option<&str> {
+        self.dir.as_deref()
+    }
+
+    pub fn get_dbfilename(&self) -> Option<&str> {
+        self.dbfilename.as_deref()
     }
 }

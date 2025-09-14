@@ -15,6 +15,11 @@ pub enum ReplConfCommand {
 }
 
 #[derive(Debug, PartialEq)]
+pub enum ConfigCommand {
+    Get(String),
+}
+
+#[derive(Debug, PartialEq)]
 pub enum Command {
     Ping,
     Echo(Vec<u8>),
@@ -31,6 +36,7 @@ pub enum Command {
         replica_count: usize,
         timeout: Duration,
     },
+    Config(ConfigCommand),
 }
 
 impl Command {
@@ -196,6 +202,25 @@ fn compile_wait_command(tokens: &[Token]) -> Result<Command> {
     }
 }
 
+fn compile_config_command(tokens: &[Token]) -> Result<Command> {
+    match tokens {
+        [Token::BulkString(config_type), rest @ ..] => {
+            let config_type = std::str::from_utf8(config_type)?.to_ascii_lowercase();
+            let command = match config_type.as_str() {
+                "get" => match rest {
+                    [Token::BulkString(pattern)] => {
+                        ConfigCommand::Get(std::str::from_utf8(pattern)?.to_string())
+                    }
+                    _ => Err(ParseError::Invalid)?,
+                },
+                _ => Err(ParseError::Invalid)?,
+            };
+            Ok(Command::Config(command))
+        }
+        _ => Err(ParseError::Invalid)?,
+    }
+}
+
 fn compile_and_get_command(tokens: &[Token]) -> Result<Command> {
     let mut tokens = tokens.iter();
     let command = match tokens.next() {
@@ -211,6 +236,7 @@ fn compile_and_get_command(tokens: &[Token]) -> Result<Command> {
                 "replconf" => compile_replconf_command(rest)?,
                 "psync" => compile_psync_command(rest)?,
                 "wait" => compile_wait_command(rest)?,
+                "config" => compile_config_command(rest)?,
                 _ => Err(ParseError::Invalid)?,
             }
         }

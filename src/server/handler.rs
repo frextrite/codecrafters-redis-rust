@@ -2,7 +2,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 use std::{net::TcpStream, sync::Arc};
 
-use crate::parser::command::ReplConfCommand;
+use crate::parser::command::{ConfigCommand, ReplConfCommand};
 use crate::parser::resp::Token;
 use crate::replication::rdb::{get_empty_rdb, serialize_rdb};
 use crate::server::data::LiveData;
@@ -33,6 +33,7 @@ impl CommandHandler {
                 replica_count,
                 timeout,
             } => self.handle_wait(*replica_count, *timeout),
+            Command::Config(config) => self.handle_config(&config),
         }
     }
 
@@ -215,6 +216,36 @@ impl CommandHandler {
             }
             ReplicaInfo::Slave(_) => panic!("Not expecting to handle WAIT at slave"),
         };
+        Ok(())
+    }
+
+    fn handle_config(&mut self, config: &ConfigCommand) -> std::io::Result<()> {
+        println!("DEBUG: received CONFIG command {config:?}");
+        match config {
+            ConfigCommand::Get(param) => {
+                let rdb_config = self.server.metadata.rdb_config.as_ref();
+                let response = match rdb_config {
+                    None => {
+                        unimplemented!("Not expecting to handle CONFIG GET when rdb_config is None")
+                    }
+                    Some(rdb) => {
+                        let response_key = param.as_str();
+                        let response_value = match response_key {
+                            "dir" => rdb.dir.as_str(),
+                            "dbfilename" => rdb.dbfilename.as_str(),
+                            _ => panic!("Not expecting to handle CONFIG GET for param {param:?}"),
+                        };
+                        Token::Array(vec![
+                            Token::BulkString(response_key.as_bytes().to_vec()),
+                            Token::BulkString(response_value.as_bytes().to_vec()),
+                        ])
+                    }
+                };
+                self.write_response(response)?;
+            }
+            #[allow(unused)]
+            _ => panic!("Not expecting to handle CONFIG command {config:?}"),
+        }
         Ok(())
     }
 

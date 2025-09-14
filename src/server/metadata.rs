@@ -21,9 +21,16 @@ pub enum ReplicaInfo {
 }
 
 #[derive(Debug)]
+pub struct RdbConfig {
+    pub dir: String,
+    pub dbfilename: String,
+}
+
+#[derive(Debug)]
 pub struct ServerMetadata {
     pub listening_port: u16,
     pub replica_info: ReplicaInfo,
+    pub rdb_config: Option<RdbConfig>,
 }
 
 impl ServerMetadata {
@@ -43,9 +50,17 @@ impl ServerMetadata {
                 })
             }
         };
+        let rdb_config = match (config.get_data_dir(), config.get_dbfilename()) {
+            (Some(dir), Some(dbfilename)) => Some(RdbConfig {
+                dir: dir.to_string(),
+                dbfilename: dbfilename.to_string(),
+            }),
+            _ => None,
+        };
         ServerMetadata {
             listening_port: config.get_listening_port(),
             replica_info,
+            rdb_config,
         }
     }
 
